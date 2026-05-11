@@ -710,7 +710,7 @@ class ModelBase:
                 self._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
         # Flush any remaining experts (fallback if n_experts was unknown)
-        for bid, proj_type in expert_blocks.keys():
+        for bid, proj_type in list(expert_blocks.keys()):
             self._flush_nvfp4_experts((bid, proj_type), expert_blocks, expert_scales, expert_input_scales, expert_shapes, bid, proj_type)
 
         # Remove consumed tensors so get_tensors/modify_tensors won't see them
@@ -718,7 +718,7 @@ class ModelBase:
             self.model_tensors.pop(name, None)
 
         # Remove any remaining unused auxiliary tensors
-        for name in self.model_tensors.keys():
+        for name in list(self.model_tensors.keys()):
             if name.endswith((".k_scale", ".v_scale")):
                 del self.model_tensors[name]
 
@@ -1063,7 +1063,7 @@ class TextModel(ModelBase):
         name, gen = item
 
         # Skip multimodal tensors
-        if name.startswith(("mlp", "vit.", "vpm.", "siglip2.", "conformer.", "merger.", "resampler.", "sound_encoder.", "sound_projection.")) \
+        if name.startswith(("mlp", "vit.", "vpm.", "siglip2.", "conformer.", "merger.", "resampler.", "sound_encoder.", "sound_projection.", "speech_embeddings.")) \
                 or "visual." in name or "vision." in name or "audio." in name or "talker." in name \
                 or "vision_" in name or "audio_" in name or "sam_model" in name \
                 or "token2wav." in name or "code2wav." in name \
@@ -1360,6 +1360,9 @@ class TextModel(ModelBase):
         if chkhsh == "d4540891389ea895b53b399da6ac824becc30f2fba0e9ddbb98f92e55ca0e97c":
             # ref: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
             res = "qwen2"
+        if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
+            # ref: https://huggingface.co/openbmb/MiniCPM-V-4_6
+            res = "qwen35"
         if chkhsh == "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273":
             # ref: https://huggingface.co/alvarobartt/grok-2-tokenizer
             res = "grok-2"
@@ -1567,6 +1570,9 @@ class TextModel(ModelBase):
         if chkhsh == "862f827721df956049dff5ca81a57f29e575280bc622e290d3bf4e35eca29015":
             # ref: https://huggingface.co/codefuse-ai/F2LLM-v2-4B
             res = "f2llmv2"
+        if chkhsh == "62f6fb0a6fd5098caeabb19b07a5c1099cafc8b9c40eab6ea89ece4ec02fbc57":
+            # ref: https://huggingface.co/sarvamai/sarvam-30b
+            res = "sarvam-moe"
 
         if res is None:
             logger.warning("\n")
@@ -2170,7 +2176,8 @@ class MmprojModel(ModelBase):
             text_config = {
                 k: v for k, v in self.hparams.items() if k not in ["vision_encoder", "audio_encoder"]
             }
-            self.n_embd_text = text_config.get("hidden_dim", 0)
+            # mistral native params.json: "dim" is the text hidden size ("hidden_dim" is the FFN intermediate size)
+            self.n_embd_text = text_config.get("dim", 0)
 
         assert self.n_embd_text > 0, "n_embd not found in hparams"
 
@@ -3131,6 +3138,11 @@ class LlavaVisionModel(MmprojModel):
             assert self.hparams["norm_eps"] is not None, "norm_eps not found in params.json"
             if self.use_break_tok:
                 self.img_break_tok_id = self.find_vparam(["image_break_token_id"])
+
+                # params.json may ship -1 placeholders (Mistral Medium 3.5)
+                # resolve the real id from the bundled tokenizer in that case
+                if self.img_break_tok_id < 0:
+                    self.img_break_tok_id = self.get_mistral_token_id("[IMG_BREAK]")
         else:
             raise ValueError(f"Unsupported model type: {self.hparams['model_type']}")
         logger.info(f"Image break token id: {self.img_break_tok_id}")
@@ -3149,6 +3161,24 @@ class LlavaVisionModel(MmprojModel):
                 if token_data["content"] == token:
                     return int(token_data["id"])
         raise ValueError(f"Token '{token}' not found in tokenizer config.")
+
+    def get_mistral_token_id(self, token: str) -> int:
+        # mistral native format ships tekken.json or a versioned spm tokenizer
+        tekken_file = self.dir_model / "tekken.json"
+        if tekken_file.is_file():
+            with open(tekken_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for entry in data.get("special_tokens", []):
+                if entry.get("token_str") == token:
+                    return int(entry["rank"])
+        tokenizer_json_file = self.dir_model / "tokenizer.json"
+        if tokenizer_json_file.is_file():
+            with open(tokenizer_json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for entry in data.get("added_tokens", []):
+                if entry.get("content") == token:
+                    return int(entry["id"])
+        raise ValueError(f"Token '{token}' not found in mistral tokenizer files.")
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -5499,14 +5529,99 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+class _Qwen35MRopeMixin:
+    # Qwen3.5 always applies interleaved MRoPE (see Qwen3_5RotaryEmbedding in transformers);
+    # the upstream default mrope_section is [11, 11, 10] and llama.cpp's QWEN35 / QWEN35MOE
+    # loaders treat qwen35.rope.dimension_sections as required, so make sure it is always
+    # written even when a particular checkpoint omits the field in `rope_parameters`.
+    _QWEN35_DEFAULT_MROPE_SECTION = [11, 11, 10, 0]
+
+    gguf_writer: gguf.GGUFWriter
+    rope_parameters: dict
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()  # ty: ignore[unresolved-attribute]
+        if "mrope_section" not in self.rope_parameters:
+            self.gguf_writer.add_rope_dimension_sections(self._QWEN35_DEFAULT_MROPE_SECTION)
+
+
 @ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
-class Qwen3_5TextModel(_LinearAttentionVReorderBase):
+class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
-class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase):
+class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
+
+
+# MiniCPM-V 4.6: text tower is Qwen3.5 (linear+full hybrid attention) wrapped under
+# `model.language_model.*`; vision tower is SigLIP + a window-attention ViT merger
+# + a final DownsampleMLP merger. The same HF arch is registered twice below: once as
+# the LM (text mode) and once as the mmproj (vision mode), mirroring the Qwen3-VL setup.
+
+@ModelBase.register("MiniCPMV4_6ForConditionalGeneration")
+class MiniCPMV4_6TextModel(Qwen3_5TextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        if name.startswith("model.merger."):
+            return None
+        # MTP tensors are not used at inference yet; align with Qwen3Next behaviour
+        if name.startswith("mtp"):
+            return None
+
+        return super().filter_tensors(item)
+
+
+@ModelBase.register("MiniCPMV4_6ForConditionalGeneration")
+class MiniCPMV4_6VisionModel(MmprojModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.hparams_vision is not None:
+            # In MiniCPM-V 4.6 `vision_config.image_size` (980) describes the SigLIP
+            # positional embedding bucket grid (70 x 70), while the per-slice processing
+            # resolution is the preprocessor's `scale_resolution` (typically 448).
+            # The CLIP loader in tools/mtmd/clip.cpp consumes `clip.vision.image_size`
+            # as the slice size and warmup resolution, so report `scale_resolution` there
+            # to match the upstream MiniCPMV4_6ImageProcessorPil slicing rules.
+            scale_resolution = self.preprocessor_config.get("scale_resolution")
+            if scale_resolution is not None:
+                self.hparams_vision["image_size"] = int(scale_resolution)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        assert self.hparams_vision is not None
+
+        # projector type string is consumed by clip_projector_type_from_string() in clip.cpp
+        # (mapped to PROJECTOR_TYPE_MINICPMV4_6).
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.MINICPMV4_6)
+
+        # ViT merger 2x2 + final merger 2x2 = 4x spatial merge per dimension; used for slice alignment
+        self.gguf_writer.add_vision_projector_scale_factor(4)
+
+        # borrow wa_layer_indexes for vit_merger insertion point
+        insert_layer_id = int(self.global_config.get(
+            "insert_layer_id", self.hparams_vision.get("insert_layer_id", 6)))
+        self.gguf_writer.add_vision_wa_layer_indexes([insert_layer_id])
+
+        # SigLIP vision body uses gelu_pytorch_tanh, which matches ggml_gelu (tanh approx).
+        self.gguf_writer.add_vision_use_gelu(True)
+        self.gguf_writer.add_vision_attention_layernorm_eps(
+            self.hparams_vision.get("layer_norm_eps", 1e-6))
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        # lm_head / MTP -> belong to the LM file
+        if name.startswith(("lm_head.", "mtp")):
+            return None
+
+        return super().filter_tensors(item)
 
 
 @ModelBase.register("GPT2LMHeadModel")
@@ -7900,13 +8015,37 @@ class Gemma4Model(Gemma3Model):
         rope_freqs_full = torch.tensor(values, dtype=torch.float32)
         yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), rope_freqs_full)
 
+    def _generate_nvfp4_tensors(self):
+        # Gemma-4 stores a per-layer router.per_expert_scale ([n_expert]) that scales
+        # each expert's contribution. It's mathematically equivalent to a per-expert
+        # scalar on the down_proj output, which is exactly where ffn_down_exps_s is
+        # applied at inference. Fold it into each expert's NVFP4 weight_scale_2 so the
+        # existing NVFP4 path produces the right scales.
+        n_experts = self.find_hparam(["num_local_experts", "num_experts"], optional=True) or 0
+        for name in [n for n in self.model_tensors if n.endswith(".router.per_expert_scale")]:
+            bid_match = re.search(r"\.layers\.(\d+)\.", name)
+            if bid_match is None:
+                continue
+            bid = bid_match.group(1)
+            prefix = name[: name.index(f".layers.{bid}.") + len(f".layers.{bid}.")]
+            w2_targets = [f"{prefix}experts.{e}.down_proj.weight_scale_2" for e in range(n_experts)]
+            present = [w2 in self.model_tensors for w2 in w2_targets]
+            if not any(present):
+                continue
+            assert all(present), f"layer {bid}: partial NVFP4 quantization across experts"
+            r = self.model_tensors.pop(name)
+            for e, w2 in enumerate(w2_targets):
+                s = self.model_tensors[w2]
+                self.model_tensors[w2] = lambda s=s, r=r, i=e: s() * r()[i]
+        super()._generate_nvfp4_tensors()
+
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
 
         if name.endswith("per_dim_scale") or name.endswith("layer_scalar"):
             name = name + ".weight"
-        if ".experts." in name and not name.endswith(".weight"):
+        if ".experts." in name and not name.endswith((".weight", ".weight_scale", ".weight_scale_2", ".input_scale")):
             name += ".weight"
 
         return super().filter_tensors((name, gen))
@@ -9405,9 +9544,125 @@ class MiniMaxM2Model(TextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
-@ModelBase.register("MiMoV2FlashForCausalLM")
+@ModelBase.register("MiMoV2FlashForCausalLM", "MiMoV2ForCausalLM")
 class MimoV2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.MIMO2
+
+    # MiMo V2-Flash, V2.5 and V2.5-Pro all ship 3 trained MTP layers under model.mtp.layers.{0,1,2}.
+    # The HF config does not expose the count, so it's hardcoded to match the count found in the safetensors.
+    _n_nextn = 3
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.block_count = self.hparams["num_hidden_layers"] + self._n_nextn
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    @staticmethod
+    def _tp_aware_qkv_dequant(weight: Tensor, scale_inv: Tensor,
+                              n_q: int, n_kv: int, hd: int, vhd: int,
+                              bs: int = 128) -> Tensor:
+        # MiMo-V2.5 (TP=4) and V2.5-Pro (TP=8) ship qkv_proj sharded across TP
+        # ranks; per rank, rows are stacked as [Q_per | K_per | V_per].
+        # weight_scale_inv has ceil(rows_per_rank/bs) block-rows per rank (last
+        # may extend past rows_per_rank with phantom rows not in the weight).
+        # Naive repeat_interleave aligns rank 0 only and mis-applies scales to
+        # later ranks once rows_per_rank isn't a multiple of bs.
+        # Re-group the per-rank [Q_per|K_per|V_per] rows into a single fused
+        # [Q | K | V] tensor matching the un-sharded original layout.
+        q_size = n_q * hd
+        k_size = n_kv * hd
+        v_size = n_kv * vhd
+        total_rows = q_size + k_size + v_size
+        if weight.shape[0] != total_rows:
+            raise ValueError(f"qkv_proj weight rows {weight.shape[0]} != q+k+v {total_rows}")
+
+        # detect TP from scale_inv block count, descending order so larger matches first
+        tp = None
+        for cand in (8, 4):
+            if total_rows % cand != 0:
+                continue
+            rpr = total_rows // cand
+            bpr = (rpr + bs - 1) // bs
+            if scale_inv.shape[0] == cand * bpr:
+                tp = cand
+                break
+        if tp is None:
+            raise ValueError(
+                f"qkv_proj: cannot detect TP - scale_inv rows {scale_inv.shape[0]}, "
+                f"q+k+v {total_rows}")
+
+        q_per = q_size // tp
+        k_per = k_size // tp
+        v_per = v_size // tp
+        rows_per_rank = q_per + k_per + v_per
+        blocks_per_rank = (rows_per_rank + bs - 1) // bs
+
+        scale_inv = scale_inv.float()
+        # per-row scale-row index: rank * blocks_per_rank + (rr_in_rank // bs)
+        row_idx = torch.arange(total_rows)
+        rr = row_idx % rows_per_rank
+        rank = row_idx // rows_per_rank
+        scale_row_idx = rank * blocks_per_rank + (rr // bs)
+        # gather: (total_rows, n_col_blocks)
+        scale_per_row_block = scale_inv[scale_row_idx]
+        # expand col-blocks -> cols: each block-col covers `bs` weight cols
+        scale_full = scale_per_row_block.repeat_interleave(bs, dim=1)
+        # crop to weight col count (in case last col-block isn't full)
+        scale_full = scale_full[:, : weight.shape[1]]
+        dequant = weight.float() * scale_full
+
+        if tp == 1:
+            return dequant
+
+        # Re-group per-rank [Q_per|K_per|V_per] rows into unified [Q | K | V]
+        qs, ks, vs = [], [], []
+        for r in range(tp):
+            base = r * rows_per_rank
+            qs.append(dequant[base : base + q_per])
+            ks.append(dequant[base + q_per : base + q_per + k_per])
+            vs.append(dequant[base + q_per + k_per : base + rows_per_rank])
+        return torch.cat(qs + ks + vs, dim=0)
+
+    def dequant_model(self):
+        # Capture raw FP8 (weight, scale_inv) lambdas for qkv_proj BEFORE super
+        # rewrites them with the existing dequant. Replace super's lambda after
+        # it runs so scale_inv removal still happens via the standard path.
+        qkv_overrides: dict[str, tuple[Callable, Callable, int]] = {}
+        qc = self.hparams.get("quantization_config")
+        if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
+            pat = re.compile(r"^model\.layers\.(\d+)\.self_attn\.qkv_proj\.weight_scale_inv$")
+            for name in list(self.model_tensors.keys()):
+                m = pat.match(name)
+                if not m:
+                    continue
+                weight_name = name.removesuffix("_scale_inv")
+                if weight_name not in self.model_tensors:
+                    continue
+                qkv_overrides[weight_name] = (
+                    self.model_tensors[weight_name],
+                    self.model_tensors[name],
+                    int(m.group(1)),
+                )
+
+        super().dequant_model()
+
+        if not qkv_overrides:
+            return
+
+        n_q = self.hparams["num_attention_heads"]
+        hd = self.hparams["head_dim"]
+        vhd = self.hparams["v_head_dim"]
+        hybrid = self.hparams["hybrid_layer_pattern"]
+        n_layer_text = self.hparams["num_hidden_layers"]
+        for weight_name, (w_fn, s_fn, bid) in qkv_overrides.items():
+            # MTP layers (bid >= n_layer_text) use SWA-style attention dims
+            is_swa = True if bid >= n_layer_text else hybrid[bid] == 1
+            n_kv = self.hparams["swa_num_key_value_heads" if is_swa else "num_key_value_heads"]
+            self.model_tensors[weight_name] = (
+                lambda w_fn=w_fn, s_fn=s_fn, n_q=n_q, n_kv=n_kv, hd=hd, vhd=vhd:
+                    MimoV2Model._tp_aware_qkv_dequant(w_fn(), s_fn(), n_q, n_kv, hd, vhd)
+            )
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -9419,11 +9674,14 @@ class MimoV2Model(TextModel):
 
         n_head_kv = self.hparams["num_key_value_heads"]
         n_head_kv_swa = self.hparams["swa_num_key_value_heads"]
-        n_head_kv_arr = [n_head_kv_swa if use_swa == 1 else n_head_kv for use_swa in self.hparams["hybrid_layer_pattern"]]
+        # Extend the per-layer pattern with SWA entries for the MTP blocks so the
+        # runtime arrays (sized to extended block_count) are fully populated.
+        hybrid = list(self.hparams["hybrid_layer_pattern"]) + [1] * self._n_nextn
+        n_head_kv_arr = [n_head_kv_swa if use_swa == 1 else n_head_kv for use_swa in hybrid]
         self.gguf_writer.add_head_count_kv(n_head_kv_arr)
 
         self.gguf_writer.add_sliding_window(self.hparams["sliding_window"])
-        self.gguf_writer.add_sliding_window_pattern(self.hparams["hybrid_layer_pattern"])
+        self.gguf_writer.add_sliding_window_pattern(hybrid)
         self.gguf_writer.add_value_length(self.hparams["v_head_dim"])
         self.gguf_writer.add_expert_count(self.hparams["n_routed_experts"])
         self.gguf_writer.add_expert_feed_forward_length(self.hparams["moe_intermediate_size"])
@@ -9432,6 +9690,12 @@ class MimoV2Model(TextModel):
         self.gguf_writer.add_rope_dimension_count(rope_dim)
 
         self.gguf_writer.add_layer_norm_rms_eps(self.hparams.get("layernorm_epsilon", 1e-5))
+
+        v_scale = self.hparams.get("attention_value_scale")
+        if v_scale is not None:
+            self.gguf_writer.add_attn_value_scale(float(v_scale))
+
+        self.gguf_writer.add_nextn_predict_layers(self._n_nextn)
 
     _experts: list[dict[str, Tensor]] | None = None
 
@@ -9442,13 +9706,21 @@ class MimoV2Model(TextModel):
         if "attention_sink" in name and not name.endswith(".weight"):
             name += ".weight"
 
-        # TODO: mimo v2 does not indicate the number of next-token-prediction layers, therefore we cannot do the same way as GLM4_MOE
-        if "model.mtp." in name:
-            return None
-
         return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch, name, bid):
+        # Remap MTP/NextN tensors to additional layer slots so the standard tensor map handles them.
+        # HF: model.mtp.layers.{i}.foo  ->  model.layers.{n_layer_text + i}.foo
+        m = re.match(r"^model\.mtp\.layers\.(\d+)\.(.*)$", name)
+        if m is not None:
+            mtp_idx = int(m.group(1))
+            assert mtp_idx < self._n_nextn, f"MTP layer index {mtp_idx} >= _n_nextn ({self._n_nextn})"
+            rest = m.group(2)
+            n_layer_text = self.hparams["num_hidden_layers"]
+            new_bid = n_layer_text + mtp_idx
+            name = f"model.layers.{new_bid}.{rest}"
+            bid = new_bid
+
         # process the experts separately
         if name.find("mlp.experts") != -1:
             n_experts = self.hparams["n_routed_experts"]
@@ -11344,6 +11616,34 @@ class BailingMoeV2Model(TextModel):
             experts = [k for d in self._experts for k in d.keys()]
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
+
+
+@ModelBase.register("SarvamMoEForCausalLM", "modeling_sarvam_moe.SarvamMoEForCausalLM")
+class SarvamMoEModel(BailingMoeV2Model):
+    model_arch = gguf.MODEL_ARCH.BAILINGMOE2
+    # Sarvam-MoE shares the BailingMoeV2 architecture; only differences:
+    #  - full rotary (no partial_rotary_factor)
+    #  - expert bias is zero-mean normalized at load time
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+        if (rope_dim := hparams.get("head_dim")) is None:
+            rope_dim = hparams["hidden_size"] // hparams["num_attention_heads"]
+        # Override the partial-rotary value written by BailingMoeV2 with the full rotary dim
+        self.gguf_writer.add_rope_dimension_count(rope_dim)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.endswith(".expert_bias"):
+            # Sarvam normalizes expert bias to zero mean
+            inner = gen
+
+            def gen():
+                t = inner()
+                return t - t.mean()
+        return super().filter_tensors((name, gen))
 
 
 @ModelBase.register("GroveMoeForCausalLM", "modeling_grove_moe.GroveMoeForCausalLM")
@@ -13463,6 +13763,27 @@ class DotsOCRVisionModel(MmprojModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Sarashina2VisionForCausalLM")
+class Sarashina2VLTextModel(LlamaModel):
+    model_arch = gguf.MODEL_ARCH.LLAMA
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.startswith("llm."):
+            name = name.replace("llm.", "", 1)
+        elif name.startswith("norm."):
+            return None
+        return super().filter_tensors((name, gen))
+
+
+@ModelBase.register("Sarashina2VisionForCausalLM")
+class Sarashina2VLVisionModel(Qwen2VLVisionModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.global_config['model_type'] = "qwen2_vl"
+
+
 ###### CONVERSION LOGIC ######
 
 
@@ -13719,7 +14040,7 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # Step3-VL keeps text config under text_config but uses a custom top-level architecture.
     # For text conversion we route to a dedicated text-only class.
     # TODO: refactor this later to avoid adding exception here
-    if model_type == ModelType.TEXT and arch == "StepVLForConditionalGeneration":
+    if model_type == ModelType.TEXT and arch in ("StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM"):
         return arch
 
     # if "architectures" is found in the sub-config, use that instead
