@@ -157,9 +157,9 @@ enum common_params_sampling_config : uint64_t {
 
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
@@ -342,6 +342,7 @@ struct common_params_speculative_ngram_cache {
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
+    // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
     common_params_speculative_ngram_mod ngram_mod;
@@ -603,10 +604,22 @@ struct common_params {
 
     std::map<std::string, std::string> default_template_kwargs;
 
-    // webui configs
-    bool webui = true;
+    // UI configs
+#ifdef LLAMA_UI_DEFAULT_ENABLED
+    bool ui = LLAMA_UI_DEFAULT_ENABLED != 0;
+#elif defined(LLAMA_WEBUI_DEFAULT_ENABLED)
+    bool ui = LLAMA_WEBUI_DEFAULT_ENABLED != 0;
+#else
+    bool ui = true; // default to enabled when not set
+#endif
+
+    // Deprecated: use ui, ui_mcp_proxy, ui_config_json instead
+    bool webui = ui;
     bool webui_mcp_proxy = false;
     std::string webui_config_json;
+
+    bool ui_mcp_proxy = false;
+    std::string ui_config_json;
 
     // "advanced" endpoints are disabled by default for better security
     bool endpoint_slots   = true;
@@ -685,6 +698,7 @@ struct common_params {
 // initializes the logging system and prints info about the build
 void common_init();
 
+void common_params_print_info(const common_params & params);
 std::string common_params_get_system_info(const common_params & params);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
