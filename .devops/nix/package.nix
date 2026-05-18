@@ -19,6 +19,7 @@
   openssl,
   shaderc,
   spirv-headers,
+  llama-cpp-ui,
   useBlas ?
     builtins.all (x: !x) [
       useCuda
@@ -130,7 +131,12 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     src = lib.cleanSource ../../.;
   };
 
-  postPatch = ''
+  # Stage the prebuilt web UI assets where tools/ui/CMakeLists.txt looks for a
+  # "local" UI source. This makes the build hermetic: it never falls through to
+  # the npm build / Hugging Face download path, which need network access.
+  postPatch = lib.optionalString useWebUi ''
+    mkdir -p build/tools/ui/dist
+    cp ${llama-cpp-ui}/* build/tools/ui/dist/
   '';
 
   # With PR#6015 https://github.com/ggml-org/llama.cpp/pull/6015,
@@ -168,6 +174,10 @@ effectiveStdenv.mkDerivation (finalAttrs: {
   cmakeFlags =
     [
       (cmakeBool "LLAMA_BUILD_SERVER" true)
+      # Pass both the current and the deprecated option name: the in-tree
+      # backward-compat shim does not actually forward one to the other (both
+      # are declared with `option()`, so neither is ever undefined).
+      (cmakeBool "LLAMA_BUILD_UI" useWebUi)
       (cmakeBool "LLAMA_BUILD_WEBUI" useWebUi)
       (cmakeBool "BUILD_SHARED_LIBS" (!enableStatic))
       (cmakeBool "CMAKE_SKIP_BUILD_RPATH" true)

@@ -8,6 +8,11 @@ get_filename_component(filename "${INPUT}" NAME)
 string(REGEX REPLACE "\\.|-" "_" name "${filename}")
 
 file(READ "${INPUT}" hex_data HEX)
+
+if(NOT hex_data)
+    message(FATAL_ERROR "xxd.cmake: input file is empty or missing: ${INPUT}")
+endif()
+
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," hex_sequence "${hex_data}")
 
 string(LENGTH ${hex_data} hex_len)
