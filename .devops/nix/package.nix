@@ -3,6 +3,7 @@
   glibc,
   config,
   stdenv,
+  stdenvNoCC,
   runCommand,
   cmake,
   ninja,
@@ -19,7 +20,8 @@
   openssl,
   shaderc,
   spirv-headers,
-  llama-cpp-ui,
+  nodejs,
+  importNpmLock,
   useBlas ?
     builtins.all (x: !x) [
       useCuda
@@ -131,12 +133,31 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     src = lib.cleanSource ../../.;
   };
 
-  # Stage the prebuilt web UI assets where tools/ui/CMakeLists.txt looks for a
-  # "local" UI source. This makes the build hermetic: it never falls through to
-  # the npm build / Hugging Face download path, which need network access.
+  # Builds the webui locally, taking care not to require updating any sha256 hash.
+  webui = stdenvNoCC.mkDerivation {
+    pname = "webui";
+    version = llamaVersion;
+    src = lib.cleanSource ../../tools/ui;
+
+    nativeBuildInputs = [
+      nodejs
+      importNpmLock.linkNodeModulesHook
+    ];
+
+    # no sha256 required when using buildNodeModules
+    npmDeps = importNpmLock.buildNodeModules {
+      npmRoot = ../../tools/ui;
+      inherit nodejs;
+    };
+
+    installPhase = ''
+      LLAMA_UI_OUT_DIR=$out npm run build --offline
+    '';
+  };
+
   postPatch = lib.optionalString useWebUi ''
-    mkdir -p build/tools/ui/dist
-    cp ${llama-cpp-ui}/* build/tools/ui/dist/
+    cp -r ${finalAttrs.webui} tools/ui/dist
+    chmod -R u+w tools/ui/dist
   '';
 
   # With PR#6015 https://github.com/ggml-org/llama.cpp/pull/6015,
@@ -174,10 +195,6 @@ effectiveStdenv.mkDerivation (finalAttrs: {
   cmakeFlags =
     [
       (cmakeBool "LLAMA_BUILD_SERVER" true)
-      # Pass both the current and the deprecated option name: the in-tree
-      # backward-compat shim does not actually forward one to the other (both
-      # are declared with `option()`, so neither is ever undefined).
-      (cmakeBool "LLAMA_BUILD_UI" useWebUi)
       (cmakeBool "LLAMA_BUILD_WEBUI" useWebUi)
       (cmakeBool "BUILD_SHARED_LIBS" (!enableStatic))
       (cmakeBool "CMAKE_SKIP_BUILD_RPATH" true)
