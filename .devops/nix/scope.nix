@@ -28,7 +28,6 @@ lib.makeScope newScope (self: {
       ;
   };
   python-scripts = self.callPackage ./python-scripts.nix { inherit (pythonPackages) buildPythonPackage poetry-core; };
-  llama-cpp-ui = self.callPackage ./package-ui.nix { };
   llama-cpp = self.callPackage ./package.nix { };
   docker = self.callPackage ./docker.nix { };
   docker-min = self.callPackage ./docker.nix { interactive = false; };
