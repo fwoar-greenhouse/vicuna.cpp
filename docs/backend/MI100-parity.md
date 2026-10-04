@@ -66,6 +66,19 @@ Every change is measured on the whole benchmark suite below, not on one model.
 
 Model-specific tuning (for example Qwen3.8-27B verify shapes) comes after this list.
 
+### Item 2 status (2026-10-04)
+
+Done: MMVQ/MMQ crossover per type and matrix size (`mmvq_max_ncols`), MMQ register prefetch of the next x tile (two-phase `load_tiles`), MMQ J=16/32 with 4 warps, I=64, 2 blocks per CU.
+MMQ at J=16 now reaches ~370-400 GB/s for K-quants and ~550-580 GB/s for Q8_0 on 17408x5120 / 5120x17408. On matrices with >= 4096 rows MMVQ still wins up to 2 columns for Q4_K/Q5_K, 4 for Q6_K/Q8_0 and 5 for Q4_0.
+
+Tried without gain:
+- MMVQ for MUL_MAT_ID up to 16 tokens: microbench with random routing favors MMVQ, but real routing reuses experts and MMQ wins (26B-A4B pp16 -11%).
+- MMQ I=32 (128 threads, occupancy 4): slower, up to 1.4x for Q8_0.
+- L2 prefetch of the next x tile with throwaway loads: slower; the duplicate requests compete with the real loads.
+- `sched_group_barrier` to issue all tile loads first: no gain without overlap across iterations.
+
+Design note, needs a weight repack (deferred): a skinny MFMA kernel without LDS for x. Each wave owns 16 rows and loads them straight into the B operand of `v_mfma_i32_16x16x16i8` (y as A, so each lane keeps its own row scale), with y shared through L1. A prototype for Q8_0 reached only ~360 GB/s: with the row-major block layout one load instruction touches 16 rows x 32 bytes, and even x alone stays below ~490 GB/s. A repack that stores, per 16-row group and 32-value block, the 16 rows' bytes in MFMA operand order would turn this into 512-byte contiguous loads per wave. Combined with per-row scales next to the data, this could serve 1-16 columns with one kernel at MMVQ-like bandwidth and MFMA compute.
+
 ### Benchmark suite
 
 All under `~/.cache/huggingface/hub/`, run with `HIP_VISIBLE_DEVICES=0 llama-bench -ngl 99 -fa 1 -p 2,4,8,16,512 -n 128`:
