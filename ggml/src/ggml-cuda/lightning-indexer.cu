@@ -211,9 +211,6 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const half  *   m_d = (const half  *)   m->data;
     float       * dst_d = (      float *) dst->data;
 
-    const int device = ggml_cuda_get_device();
-    const int cc     = ggml_cuda_info().devices[device].cc;
-
     if (n_embd == 128 && n_head == 64) {
         {
             // use vector kernel

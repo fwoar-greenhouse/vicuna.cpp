@@ -5,17 +5,6 @@
 #include "ggml.h"
 
 
-template<typename T, int BLOCK_SIZE>
-static __global__ void cumsum_cub_kernel(
-        const T * __restrict__ src,
-        T * __restrict__ dst,
-        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
-        const int64_t  s01, const int64_t  s02, const int64_t  s03,
-        const int64_t   s1,  const int64_t   s2,  const int64_t   s3) {
-    NO_DEVICE_CODE;
-}
-
-// Fallback kernel implementation
 template<typename T>
 static __global__ void cumsum_kernel(
         const T * src, T * dst,
@@ -129,7 +118,6 @@ static void cumsum_cuda(
         cudaStream_t stream) {
 
     const size_t type_size = sizeof(T);
-    bool use_cub = false;
     dim3 grid_dims(ne01, ne02, ne03);
     const auto &info = ggml_cuda_info().devices[ggml_cuda_get_device()];
     const int warp_size = info.warp_size;
@@ -140,21 +128,12 @@ static void cumsum_cuda(
     const int warps_per_block = block_size / warp_size;
     const size_t shmem_size = (block_size + warps_per_block + 2) * sizeof(float);
 
-    if (use_cub && ne00 >= 1024) {
-        cumsum_cub_kernel<T, CUDA_CUMSUM_BLOCK_SIZE><<<grid_dims, CUDA_CUMSUM_BLOCK_SIZE, 0, stream>>>(
-            src, dst,
-            ne00, ne01, ne02, ne03,
-            nb01 / type_size, nb02 / type_size, nb03 / type_size,
-            nb1 / type_size,  nb2 / type_size,  nb3 / type_size
-        );
-    } else {
-        cumsum_kernel<<<grid_dims, block_dims, shmem_size, stream>>>(
-            src, dst,
-            ne00, ne01, ne02, ne03,
-            nb00 / type_size, nb01 / type_size, nb02 / type_size, nb03 / type_size,
-            nb0 / type_size, nb1 / type_size, nb2 / type_size, nb3 / type_size
-        );
-    }
+    cumsum_kernel<<<grid_dims, block_dims, shmem_size, stream>>>(
+        src, dst,
+        ne00, ne01, ne02, ne03,
+        nb00 / type_size, nb01 / type_size, nb02 / type_size, nb03 / type_size,
+        nb0 / type_size, nb1 / type_size, nb2 / type_size, nb3 / type_size
+    );
 }
 
 void ggml_cuda_op_cumsum(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

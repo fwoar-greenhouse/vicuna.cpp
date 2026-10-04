@@ -1,25 +1,4 @@
-
-#ifdef USE_CUB
-#include <cub/cub.cuh>
-using namespace cub;
-#endif // USE_CUB
-
 #include "ssm-scan.cuh"
-
-
-// Minimum number of tokens to use SSD (State Space Duality) matmul path instead of scan path.
-// For n_tok <= this threshold, the scan kernel is used (lower overhead for short sequences).
-#define SSM_SSD_MIN_TOKENS 128
-
-// prepare_dt kernel dimensions: one block per (head, seq), each block handles DT_MAX_ITEMS items.
-#define SSM_SSD_DT_BLOCK     256
-#define SSM_SSD_DT_MAX_ITEMS  32
-
-// Maximum tokens the SSD path supports, derived from the prepare_dt kernel block capacity.
-#define SSM_SSD_MAX_TOKENS (SSM_SSD_DT_BLOCK * SSM_SSD_DT_MAX_ITEMS)
-
-// Chunk size for chunked SSD. Caps matmul cost at O(chunk^2) per chunk.
-#define SSM_SSD_CHUNK_SIZE 256
 
 // We would like to keep pragma unroll for cases where L_template is not 0,
 // so we suppress the clang transformation warning.
@@ -68,20 +47,6 @@ __global__ void __launch_bounds__(splitD, 1)
     __shared__ float smemB[N];
     __shared__ float smemC[N];
 
-#ifdef USE_CUB
-    using BlockLoad = cub::BlockLoad<float, splitD, N, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
-    using BlockStore = cub::BlockStore<float, splitD, N, cub::BLOCK_STORE_WARP_TRANSPOSE>;
-
-    union CubTempStorage {
-        typename BlockLoad::TempStorage load_temp;
-        typename BlockStore::TempStorage store_temp;
-    };
-    __shared__ CubTempStorage cub_temp_storage;
-
-    BlockLoad(cub_temp_storage.load_temp).Load(A_block, regA);
-    __syncthreads();
-    BlockLoad(cub_temp_storage.load_temp).Load(s0_block, regs0);
-#else
     const int stride_s0 = src0_nb2 / sizeof(float);
     const int stride_A = src3_nb1 / sizeof(float);
 #pragma unroll
@@ -90,7 +55,6 @@ __global__ void __launch_bounds__(splitD, 1)
         regA[n] = A_block[threadIdx.x * stride_A + n];
         regs0[n] = s0_block[threadIdx.x * stride_s0 + n];
     }
-#endif
 
 #pragma unroll
     for (size_t i = 0; i < L; i++)
@@ -121,16 +85,12 @@ __global__ void __launch_bounds__(splitD, 1)
         __syncthreads();
     }
 
-#ifdef USE_CUB
-    BlockStore(cub_temp_storage.store_temp).Store(s_block, regs0);
-#else
     const int stride_s = stride_s0;
 #pragma unroll
     for (size_t n = 0; n < N; ++n)
     {
         s_block[threadIdx.x * stride_s + n] = regs0[n];
     }
-#endif
 }
 #ifdef __clang__
 #pragma clang diagnostic pop
@@ -400,7 +360,7 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src6->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
-    // Byte strides are narrowed to int for both scan and SSD paths.
+    // Byte strides are narrowed to int for the scan kernels.
     GGML_ASSERT(src0->nb[2] <= (size_t)INT_MAX);
     GGML_ASSERT(src0->nb[3] <= (size_t)INT_MAX);
     GGML_ASSERT(src1->nb[2] <= (size_t)INT_MAX);

@@ -1,25 +1,5 @@
 #include "argsort.cuh"
 
-
-static __global__ void init_indices(int * indices, const int ncols, const int nrows) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = blockIdx.y;
-
-    if (col < ncols && row < nrows) {
-        indices[row * ncols + col] = col;
-    }
-}
-
-#ifndef STRIDED_ITERATOR_AVAILABLE
-static __global__ void init_offsets(int * offsets, const int ncols, const int nrows) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx <= nrows) {
-        offsets[idx] = idx * ncols;
-    }
-}
-#endif  // STRIDED_ITERATOR_AVAILABLE
-
-
 // Bitonic sort implementation
 template<typename T>
 static inline __device__ void ggml_cuda_swap(T & a, T & b) {
@@ -111,7 +91,6 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     const dim3 block_nums(nrows, 1, 1);
     const size_t shared_mem = ncols_pad * sizeof(int);
 
-    // FIXME: this limit could be raised by ~2-4x on Ampere or newer
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
     if (order == GGML_SORT_ORDER_ASC) {

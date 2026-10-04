@@ -1,36 +1,6 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
-
-#ifdef CUB_TOP_K_AVAILABLE
-
-static void top_k_cub(ggml_cuda_pool & pool,
-                      const float *    src,
-                      int *            dst,
-                      const int        ncols,
-                      const int        k,
-                      cudaStream_t     stream) {
-    auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
-                                                 cuda::execution::output_ordering::unsorted);
-    auto stream_env   = cuda::stream_ref{ stream };
-    auto env          = cuda::std::execution::env{ stream_env, requirements };
-
-    auto indexes_in = cuda::make_counting_iterator(0);
-
-    size_t temp_storage_bytes = 0;
-    CUDA_CHECK(DeviceTopK::MaxPairs(nullptr, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst, ncols, k,
-                         env));
-
-    ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
-    void *                        d_temp_storage = temp_storage_alloc.get();
-
-    CUDA_CHECK(DeviceTopK::MaxPairs(d_temp_storage, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst,
-                         ncols, k, env));
-}
-
-#endif                            // CUB_TOP_K_AVAILABLE
-
-
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
     const uint32_t mask = (uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U;
@@ -205,14 +175,6 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
-#ifdef CUB_TOP_K_AVAILABLE
-    // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
-    // https://github.com/NVIDIA/cccl/issues/6391
-    // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
-    for (int i = 0; i < nrows; i++) {
-        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
-    }
-#else                             // GGML_CUDA_USE_CUB
     if (ncols > 1024) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     } else {
@@ -222,5 +184,4 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
                                      cudaMemcpyDeviceToDevice, stream));
     }
-#endif
 }
