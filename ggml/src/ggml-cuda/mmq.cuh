@@ -1336,9 +1336,6 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 #define DECL_MMQ_CASE(type)                                                        \
     template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
-// No-op, the native FP4 (W4A4) path is not built. Kept for template-instances/*.cu.
-#define DECL_MMQ_CASE_W4A4(type) static_assert((type) != GGML_TYPE_COUNT, "bad type")
-
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
