@@ -11,18 +11,55 @@ Line numbers refer to the upstream base `83209c3d2` and can drift after the gfx9
 MI100 peak rates: f16 MFMA ~185 TFLOPS, i8 MFMA ~185 TOPS, bf16 ~92 TFLOPS, f32 MFMA ~46 TFLOPS, 1.23 TB/s HBM2, 120 CUs, 64 KB LDS per CU, wave64.
 Because i8 and f16 run at the same rate, MMQ helps by saving dequantization work and memory traffic, not by a higher peak rate.
 
-## Priority for the srv2 workload
+## Baseline (2026-10-03, srv2, before any optimization)
 
-Workload: dense Qwen3.8-27B UD-Q5_K_S, single user, decode plus MTP speculative verify at 2-16 tokens.
+Model facts (GGUF metadata): arch `qwen35`, 65 layers, full attention every 4th layer (about 16 attention layers, the rest gated DeltaNet), 24 Q heads, 4 KV heads (GQA 6), head dim 256, DeltaNet state 128, inner size 6144.
 
-- [ ] 1. Flash attention for 2-16 query rows with GQA (item A1). This is the verify path.
-- [ ] 2. Q5_K matmul at verify widths 2-16 (items A12 and A4, small J). Also try load-time weight repacking.
-- [ ] 3. MMVQ decode tuning at ncols=1 (item A12). Target: more than 85% of 1.23 TB/s.
-- [ ] 4. Gated DeltaNet state update, if the model has those layers.
-- [ ] 5. Use the physical warp size (64) in softmax and topk-moe (item A11).
-- [ ] 6. Flash attention load pipelining for 128k+ context verify (item A5).
+llama-bench, Qwen3.8-27B UD-Q5_K_S (17.37 GiB), `-ngl 99 -fa 1`, HIP_VISIBLE_DEVICES=0:
 
-Deferred, because this model does not use them: A2, A3, A7, A8, A9, A10, A13.
+| test | t/s |
+|---|---:|
+| pp2 | 44.6 |
+| pp4 | 69.2 |
+| pp8 | 119.4 |
+| pp16 | 228.3 |
+| pp512 | 630.7 |
+| tg128 | 28.4 |
+
+- Decode reads about 18.65 GB per token, so tg128 is about 530 GB/s, or 43% of peak (48% of the ~1.1 TB/s that tuned GEMV kernels reach on MI100).
+- A verify step at 16 tokens costs about 2.0x a decode step (1.56x the 2-token step).
+- With head dim 256, the MFMA FA kernel runs only when ne1 * 6 > 64 (verify width >= 11). Decode and most verify steps use the tile kernel.
+- Throughput drifts down about 1% per few minutes of sustained load. Interleave A/B runs.
+
+## Priority: generic parity first
+
+Goal: bring the gfx908 backend to parity with the CUDA backend across model types before any model-specific tuning.
+An item is generic if it helps a whole op family (all quant types, all head sizes) and not one model's shapes.
+Every change is measured on the whole benchmark suite below, not on one model.
+
+1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s.
+2. [ ] Small-batch quantized matmul, 2-16 columns, all types (A12, A4, A6): multi-row MMVQ, then MFMA MMQ with wider J and 32x32 i8 tiles (P1, P5, P8).
+3. [ ] Flash attention for 1-16 query rows, all head sizes and GQA ratios (A1, A2): split-KV MFMA with 4x4x4 / 16x16x16 shapes, including D=512 (P4).
+4. [ ] MoE MUL_MAT_ID without the host-synchronizing hipBLAS fallback (A3).
+5. [ ] Wave64-aware small kernels with DPP reductions (A11, P2).
+6. [ ] Flash attention load pipelining (A5).
+7. [ ] Gated DeltaNet / linear-attention decode and verify kernel (P1, P3).
+8. [ ] Remaining gaps A7-A10, A13.
+
+Model-specific tuning (for example Qwen3.8-27B verify shapes) comes after this list.
+
+### Benchmark suite
+
+All under `~/.cache/huggingface/hub/`, run with `HIP_VISIBLE_DEVICES=0 llama-bench -ngl 99 -fa 1 -p 2,4,8,16,512 -n 128`:
+
+| model | file | type | attention | exercises |
+|---|---|---|---|---|
+| Qwen3.8-27B | UD-Q5_K_S (17.4 GiB) | dense hybrid, 65 layers, GDN + full attention every 4th layer | D=256, GQA 6 | MMVQ/MMQ, GDN, FA D=256 |
+| Gemma 4 31B | UD-Q5_K_XL (20.4 GiB) | dense, 60 layers | SWA D=256 GQA 2; global D=512 GQA 8 | MMVQ/MMQ, FA D=256 and D=512 |
+| Gemma 4 26B-A4B | UD-Q5_K_XL (19.8 GiB) | MoE | as Gemma 4 | MUL_MAT_ID, MoE fusions |
+| Gemma 4 26B-A4B QAT | UD-Q4_K_XL (13.3 GiB) | MoE | as Gemma 4 | MUL_MAT_ID at Q4 |
+
+Each model also has an MTP draft GGUF (`mtp-*.gguf`) for speculative-decoding tests.
 
 ## All gaps
 
@@ -41,6 +78,25 @@ Deferred, because this model does not use them: A2, A3, A7, A8, A9, A10, A13.
 | A11 | 32-lane logical warps on wave64 (`softmax.cu:308,377`, `topk-moe.cu:91,115`) | full warps | half of each wave is idle | Template on `ggml_cuda_get_physical_warp_size()`. |
 | A12 | MMVQ/MMVF tuning (`mmvq.cu:105-145,468-598`) | per-arch tables | shares the GCN table | Sweep nwarps 4/8 at ncols=1 for CDNA1. |
 | A13 | Multi-GPU | NCCL on by default | RCCL off by default; internal allreduce | Turn on `GGML_HIP_RCCL` for multi-MI100 nodes. |
+
+## Prior art
+
+Collected 2026-10-03. Most numbers are self-reported by the authors.
+
+| # | Source | What it shows | Informs |
+|---|---|---|---|
+| P1 | [sixvolts/llama-gfx908-rune](https://github.com/sixvolts/llama-gfx908-rune) (llama.cpp fork for MI100, ROCm 6.4.3) | Q8_0 GEMV with compile-time K unroll, all loads issued first, 8-byte loads, 4 rows per block for 2-4 columns (bit-exact). MMQ column loop as straight-line 1/2/4/full variants (runtime bounds spill accumulators), and load/LDS-store split around `sched_barrier`. GDN: 16 lanes per state column, DPP sums, float4 k/q ring, `__launch_bounds__(64,1)` (2 waves/SIMD spills to AGPR and forces `vmcnt(0)`). Decode 34.5 -> 45.6 t/s on a GDN MoE. | 1, 2, 3, 5 |
+| P2 | [sixvolts/llamacpp-gfx906-furnace](https://github.com/sixvolts/llamacpp-gfx906-furnace), [reinstinct](https://github.com/sixvolts/reinstinct) (MI50) | Three-plane Q4_K/Q5_K/Q6_K repack at load: matvec goes from ~58% to ~89% of HBM with dp4a. Qwen3.8 27B at 35.3 t/s decode on a 1 TB/s MI50 (vs 26.0 for llama.cpp). DPP/ds_swizzle reductions instead of ds_bpermute. | 1, 2, 5 |
+| P3 | [btbtyler09/vllm-gfx908](https://github.com/btbtyler09/vllm-gfx908) docs/mi100_decode_opt, [mi100-llm-testing](https://github.com/btbtyler09/mi100-llm-testing) | Measured GEMV ceiling 1.10-1.17 TB/s (wvSplitK bf16). Graph node floor 1.3-1.8 us. W4 GEMV design rules (10-20 KB in flight per CU, lanes along K, dot4 with Q8_1, DPP, no split-K). Fused HIP GDN decode 5.6 us vs 11.8 us for the FLA Triton kernel. gfx908 has `v_dot4c_i32_i8`, `v_dot2c_f32_f16`, `v_dot8_i32_i4`, DPP row_bcast; no bf16_1k MFMA, `v_pk_fma_f32` or `v_dot2_f32_bf16`. | 1, 3, 5 |
+| P4 | [vLLM ROCm paged attention](https://github.com/vllm-project/vllm/blob/main/csrc/rocm/attention.cu) | Split-KV (256-token partitions) plus reduce. `v_mfma_f32_4x4x4f16` kernel for gqa <= 4, 16x16x16 above. Multi-query rows for MTP. Runs on gfx908 with the gate macro added (btbtyler09 fork). | 4, 6 |
+| P5 | llama.cpp [#14949](https://github.com/ggml-org/llama.cpp/pull/14949), #23227, #19806, #28576 | MFMA MMQ on gfx908 (1.08-3.39x at batch 32). Per-quant MMVQ->MMQ crossover (Q4_K/Q5_K to MMQ from batch 4, tuned on gfx90a only). | 2 |
+| P6 | [LLVM GCNHazardRecognizer](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AMDGPU/GCNHazardRecognizer.cpp), [amd_matrix_instruction_calculator](https://github.com/ROCm/amd_matrix_instruction_calculator) | gfx908 MFMA C/D live in AGPRs. AGPR read after MFMA write needs 4/10/18 wait states (4x4/16x16/32x32), so small tiles have the cheapest epilogue. | 2, 4 |
+| P7 | btbtyler09 GDN Triton notes | Triton on gfx908: `tl.dot` with M or N < 16 miscompiles (pad to 16). `AMDGCN_USE_BUFFER_OPS=1` causes SGPR spills. `num_stages` costs VGPRs. | 3, 4 |
+| P8 | [stew675/llama-cpp-rdna-boosts#57](https://github.com/stew675/llama-cpp-rdna-boosts/pull/57) | MMVQ with 1/2/4 rows per block per weight type for 2-8 columns, bit-exact. +22-30% for 27B with MTP (RDNA4). | 2 |
+
+Not usable on gfx908: CK flash attention (MI200+), AITER CK ops, hipBLASLt (partial), upstream vLLM skinny GEMMs (gated to gfx90a+ in source, but work when the gate is added).
+
+Power: decode barely improves above a 200 W cap on MI100 (btbtyler09). Raising the memory clock is untested on MI100.
 
 ## Not gaps
 
