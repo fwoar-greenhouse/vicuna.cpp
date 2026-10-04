@@ -47,6 +47,19 @@ Share of GPU kernel time by kernel family. "decode" = `-p 0 -n 32`, "batch 16" =
 - Qwen decode runs ~1,900 kernels per token. Small kernels take ~4.5 us each regardless of size, about 7.8 ms per token in total.
 - MMVQ alone reaches ~785 GB/s on Qwen decode (64% of peak). The rest of the gap to the 43% end-to-end figure is small-kernel time.
 
+## Progress (2026-10-04): tag mi100-pruned-verified -> 2b2b4f8
+
+Interleaved llama-bench (2 rounds, `-ngl 99 -fa 1 -r 3`, f16 KV unless noted), Nix flake build vs pre-optimization libs:
+
+| model | pp2 | pp4 | pp8 | pp16 | pp512 | tg128 |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.8-27B Q5_K_S | +3.6% | +6.2% | +14.0% | +8.4% | -0.7% | 28.2 -> 30.9 (+9.6%) |
+| Gemma 4 31B Q5_K_XL | +5.9% | +9.2% | +7.4% | +8.8% | -0.2% | 22.7 -> 25.8 (+13.7%) |
+| Gemma 4 26B-A4B Q5_K_XL | +0.2% | +2.4% | +3.5% | +9.2% | +11.4% | 94.5 -> 96.8 (+2.4%) |
+| Gemma 4 26B-A4B QAT Q4_K_XL | +3.3% | +4.6% | +3.0% | +9.3% | +17.4% | 110.3 -> 116.4 (+5.5%) |
+
+Qwen3.8-27B, KV q8_0/q8_0 at 64k depth: tg64 18.0 -> 26.5 (+47%), pp16 134.8 -> 192.1 (+42%). FA compute buffer at 262k context: 1360 -> 505 MiB.
+
 ## Priority: generic parity first
 
 Goal: bring the gfx908 backend to parity with the CUDA backend across model types before any model-specific tuning.
