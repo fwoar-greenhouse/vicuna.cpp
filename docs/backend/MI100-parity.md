@@ -55,8 +55,8 @@ Every change is measured on the whole benchmark suite below, not on one model.
 
 1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s.
 2. [ ] Small-batch quantized matmul, 2-16 columns, all types (A12, A4, A6): multi-row MMVQ, then MFMA MMQ with wider J and 32x32 i8 tiles (P1, P5, P8).
-3. [ ] Flash attention for 1-16 query rows, all head sizes and GQA ratios (A1, A2): split-KV MFMA with 4x4x4 / 16x16x16 shapes, including D=512 (P4).
-3a. [ ] Quantized KV cache in the tile and MMA FA kernels (A14): dequantize K/V tiles while loading them into LDS instead of converting the whole cache to f16 first.
+3. [x] Flash attention for 1-16 query rows, all head sizes and GQA ratios (A1, A2): split-KV MFMA with 4x4x4 / 16x16x16 shapes, including D=512 (P4). Done for D = 64/128/256/512, see the status below.
+3a. [x] Quantized KV cache in the tile and MMA FA kernels (A14): dequantize K/V tiles while loading them into LDS instead of converting the whole cache to f16 first. Done for the MMA kernel; the tile kernel only gets quantized K/V for D % 64 != 0.
 3b. [ ] More KV cache types (A15): IQ4_NL and a rotation-aware 3-4 bit codebook type (TurboQuant-style), with FA readers.
 4. [ ] MoE MUL_MAT_ID without the host-synchronizing hipBLAS fallback (A3).
 5. [ ] Wave64-aware small kernels with DPP reductions (A11, P2).
@@ -78,6 +78,23 @@ Tried without gain:
 - `sched_group_barrier` to issue all tile loads first: no gain without overlap across iterations.
 
 Design note, needs a weight repack (deferred): a skinny MFMA kernel without LDS for x. Each wave owns 16 rows and loads them straight into the B operand of `v_mfma_i32_16x16x16i8` (y as A, so each lane keeps its own row scale), with y shared through L1. A prototype for Q8_0 reached only ~360 GB/s: with the row-major block layout one load instruction touches 16 rows x 32 bytes, and even x alone stays below ~490 GB/s. A repack that stores, per 16-row group and 32-value block, the 16 rows' bytes in MFMA operand order would turn this into 512-byte contiguous loads per wave. Combined with per-row scales next to the data, this could serve 1-16 columns with one kernel at MMVQ-like bandwidth and MFMA compute.
+
+### Item 3/3a status (2026-10-04)
+
+Done:
+- Vector kernel (`fattn-vec.cuh`) rewritten with MFMA. A CUDA block works on one K/V head and 16 Q columns (Q rows x the Q heads that share the K/V head), so K/V is read once per pass instead of once per Q head. Each wave owns tiles of 16 KV rows: KQ and VKQ are `v_mfma_f32_16x16x16f16` with the Q columns as N; K is dequantized into the A operand, V^T is gathered from 4 rows per lane into the A operand, and the KQ accumulator is already the B operand of VKQ. The loads of the next tile are issued before the current tile is processed (register double buffer). All K/V types and pairs, D = 64/128/256/512.
+- The vector kernel is used for quantized K/V up to 16 Q rows and for f16 K/V if it needs at most 2 passes over K/V (or instead of the tile kernel up to 16 rows). Short f16 K/V (<= 2048) with a power of 2 GQA ratio and 1-2 Q rows stays on the tile kernel (lower fixed cost, e.g. Gemma 4 SWA layers).
+- MMA kernel reads q4_0/q4_1/q5_0/q5_1/q8_0/bf16 K/V directly (3a): each thread dequantizes whole 32-value blocks into the LDS tile. The f16-only instances are unchanged (template flag), so f16 K/V keeps its speed. No f16 copy of K/V: the compute buffer for Qwen3.8-27B with q8_0 KV at 262144 context drops from 1360 to 505 MiB and no longer grows with the context.
+
+FA op time (test-backend-ops perf, base -> new), Qwen3.8-27B shape (D=256, 4 KV heads, GQA 6), q8_0 K/V, 64k KV: 1 row 1067 -> 206 us (~700 GB/s), 4 rows 2102 -> 342 us, 16 rows 3473 -> 849 us; prefill 512 rows at 16k KV 7676 -> 7592 us (q4_0: 7677 -> 6724 us).
+llama-bench, interleaved: Qwen3.8-27B q8_0 KV tg64 at depth 65536 18.0 -> 27.3 t/s (30.2 at depth 0), pp16 142.6 -> 194.2 t/s; Gemma 4 31B q8_0 KV at depth 16384 tg64 +7%, pp16 +23%.
+
+Remaining gaps:
+- Decode reaches ~700 GB/s on long quantized K/V: one wave per SIMD (~210 VGPRs for D=256), so the per-tile latency is only hidden by the prefetch of one tile. Two waves per SIMD would need < 128 VGPRs.
+- The vector kernel has ~20 us fixed cost per call (prologue, LDS combine of 4 warps, partial results and `flash_attn_combine_results`); f16 K/V without GQA at 1.5-2k context is ~5-8% slower than the old scalar kernel.
+- D=512 f16 decode stays on the tile kernel (equal speed); the MMA kernel still loads tiles synchronously (A5).
+
+Design note for 3b (new KV types): both kernels convert in the load step only. A new type needs a raw load + unpack to 4-value groups (vector kernel: `ggml_cuda_fattn_vec_load_q`/`unpack_q`, the values become f16 by `v_perm` with 0x64 bytes) and a block loader for the MMA tiles (`flash_attn_ext_f16_load_tile_q`). A codebook type (Lloyd-Max levels for Hadamard-rotated K/V) would replace the `v_perm` + scale step with a 16-entry f16 lookup (per-lane table in registers or LDS), the rest of both kernels stays the same.
 
 ### Benchmark suite
 
@@ -136,6 +153,6 @@ KV memory for Qwen3.8-27B (16 attention layers x 4 KV heads x 256): 64 KiB per t
 ## Not gaps
 
 - Native FP4: MI100 has no FP4 hardware. MXFP4 and NVFP4 already use the i8 MFMA path.
-- Quantized KV: both vendors convert K/V to f16 for the tile and MMA kernels.
+- Quantized KV: CUDA converts K/V to f16 for the tile and MMA kernels; MI100 now reads quantized K/V in the vector and MMA kernels (3a).
 - Already work on HIP: conv2d/conv3d MFMA, rms_norm/rope/GLU/topk-moe fusions, HIP graphs, gated delta net, top-k.
 - WMMA flash attention (`GGML_HIP_ROCWMMA_FATTN`): removed upstream. gfx908 has no WMMA.
