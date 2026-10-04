@@ -56,6 +56,8 @@ Every change is measured on the whole benchmark suite below, not on one model.
 1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s.
 2. [ ] Small-batch quantized matmul, 2-16 columns, all types (A12, A4, A6): multi-row MMVQ, then MFMA MMQ with wider J and 32x32 i8 tiles (P1, P5, P8).
 3. [ ] Flash attention for 1-16 query rows, all head sizes and GQA ratios (A1, A2): split-KV MFMA with 4x4x4 / 16x16x16 shapes, including D=512 (P4).
+3a. [ ] Quantized KV cache in the tile and MMA FA kernels (A14): dequantize K/V tiles while loading them into LDS instead of converting the whole cache to f16 first.
+3b. [ ] More KV cache types (A15): IQ4_NL and a rotation-aware 3-4 bit codebook type (TurboQuant-style), with FA readers.
 4. [ ] MoE MUL_MAT_ID without the host-synchronizing hipBLAS fallback (A3).
 5. [ ] Wave64-aware small kernels with DPP reductions (A11, P2).
 6. [ ] Flash attention load pipelining (A5).
@@ -93,6 +95,8 @@ Each model also has an MTP draft GGUF (`mtp-*.gguf`) for speculative-decoding te
 | A10 | ARGSORT on large rows (`common.cuh:114-116`, `ggml-cuda.cu:5577-5586`) | CUB segmented sort | bitonic only; rows above 16384 columns fall back to CPU | hipCUB / rocPRIM segmented radix sort. |
 | A11 | 32-lane logical warps on wave64 (`softmax.cu:308,377`, `topk-moe.cu:91,115`) | full warps | half of each wave is idle | Template on `ggml_cuda_get_physical_warp_size()`. |
 | A12 | MMVQ/MMVF tuning (`mmvq.cu:105-145,468-598`) | per-arch tables | shares the GCN table | Sweep nwarps 4/8 at ncols=1 for CDNA1. |
+| A14 | Quantized KV in tile/MMA FA (`fattn.cu` need_f16_K/V, `fattn-common.cuh` f16 extra data) | same as gfx908 (converts to f16) | Prefill and verify convert the whole visible K and V to f16 in a scratch buffer (`nelements*2` bytes each; ~1 GiB at 262k ctx for Qwen3.8-27B) on every call | Dequantize K/V tiles to f16 in LDS inside the tile and MMA kernels. Saves the scratch memory and the conversion traffic. Beyond CUDA parity. |
+| A15 | KV cache types | same set | FA reads only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 in-kernel | Add IQ4_NL and a 3-4 bit Lloyd-Max codebook type for Hadamard-rotated K/V (llama.cpp already rotates quantized KV, `attn_rot_k/v`); optional QJL residual later. Needs a ggml type, CPU reference, SET_ROWS quantize kernel and FA readers. |
 | A13 | Multi-GPU | NCCL on by default | RCCL off by default; internal allreduce | Turn on `GGML_HIP_RCCL` for multi-MI100 nodes. |
 
 ## Prior art
@@ -113,6 +117,8 @@ Collected 2026-10-03. Most numbers are self-reported by the authors.
 Not usable on gfx908: CK flash attention (MI200+), AITER CK ops, hipBLASLt (partial), upstream vLLM skinny GEMMs (gated to gfx90a+ in source, but work when the gate is added).
 
 Power: decode barely improves above a 200 W cap on MI100 (btbtyler09). Raising the memory clock is untested on MI100.
+
+KV memory for Qwen3.8-27B (16 attention layers x 4 KV heads x 256): 64 KiB per token at f16, so 262k context is ~16 GiB f16, ~8.5 GiB q8_0, ~4.5 GiB q4_0. Mixed K/V types (for example K q8_0, V q4_0) used to fall back to an f16 conversion on every decode call; commit 0e1f695d0 compiles all FA K-V pairs by default.
 
 ## Not gaps
 
