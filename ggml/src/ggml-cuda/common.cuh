@@ -238,6 +238,27 @@ static __device__ __forceinline__ float warp_reduce_max(float x) {
     return x;
 }
 
+// x from lane (lane ^ mask) of the wave64, same as __shfl_xor(x, mask, 64).
+// Uses DPP for mask 1/2 and ds_swizzle for mask 4..16 instead of ds_bpermute.
+template<int mask>
+static __device__ __forceinline__ float ggml_cuda_shfl_xor64(float x) {
+    static_assert(mask > 0 && mask < 64 && (mask & (mask - 1)) == 0, "mask must be a power of 2 below 64");
+#if defined(CDNA)
+    if constexpr (mask == 1) {
+        return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0xB1, 0xF, 0xF, false)); // quad_perm [1,0,3,2]
+    } else if constexpr (mask == 2) {
+        return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0x4E, 0xF, 0xF, false)); // quad_perm [2,3,0,1]
+    } else if constexpr (mask < 32) {
+        // ds_swizzle bit mode: offset = and_mask | or_mask << 5 | xor_mask << 10, within 32 lanes
+        return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x1F | (mask << 10)));
+    } else {
+        return __shfl_xor(x, mask, 64);
+    }
+#else
+    return __shfl_xor_sync(0xffffffff, x, mask, 64);
+#endif // defined(CDNA)
+}
+
 template<typename T, int width = WARP_SIZE>
 static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
     const int lane_id = threadIdx.x % width;
