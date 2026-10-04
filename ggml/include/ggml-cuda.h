@@ -10,9 +10,6 @@ extern "C" {
 #ifdef GGML_USE_HIP
 #define GGML_CUDA_NAME "ROCm"
 #define GGML_CUBLAS_NAME "hipBLAS"
-#elif defined(GGML_USE_MUSA)
-#define GGML_CUDA_NAME "MUSA"
-#define GGML_CUBLAS_NAME "muBLAS"
 #else
 #define GGML_CUDA_NAME "CUDA"
 #define GGML_CUBLAS_NAME "cuBLAS"

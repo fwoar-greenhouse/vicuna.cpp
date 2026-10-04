@@ -112,10 +112,6 @@ if (NOT GGML_LLAMAFILE_DEFAULT)
     set(GGML_LLAMAFILE_DEFAULT OFF)
 endif()
 
-if (NOT GGML_CUDA_GRAPHS_DEFAULT)
-    set(GGML_CUDA_GRAPHS_DEFAULT OFF)
-endif()
-
 # general
 option(GGML_STATIC "ggml: static link libraries"                     OFF)
 option(GGML_NATIVE "ggml: optimize the build for the current system" ${GGML_NATIVE_DEFAULT})
@@ -197,16 +193,10 @@ option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"               
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
-option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING
                                             "ggml: FlashAttention K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q8_0-q4_0\"")
-option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
-option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
-set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
-                                            "ggml: cuda link binary compression mode; requires cuda 12.8+")
-set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
@@ -214,19 +204,9 @@ option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Lib
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)
-option(GGML_ZDNN                            "ggml: use zDNN"                                  OFF)
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_OPENMP_FETCH                    "ggml: fetch LLVM OpenMP"                         OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
-
-option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
-option(GGML_ET                              "ggml: use ET backend"                            OFF)
-option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
-
-option(GGML_HEXAGON                         "ggml: enable Hexagon backend"                    OFF)
-
-option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
-option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
 
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
@@ -280,13 +260,10 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-alloc.h
     include/ggml-backend.h
     include/ggml-blas.h
-    include/ggml-cann.h
     include/ggml-cpp.h
     include/ggml-cuda.h
     include/ggml-opt.h
     include/ggml-rpc.h
-    include/ggml-zendnn.h
-    include/ggml-openvino.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
