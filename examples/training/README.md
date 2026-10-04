@@ -3,8 +3,8 @@
 This directory contains examples related to language model training using llama.cpp/GGML.
 So far finetuning is technically functional (for FP32 models and limited hardware setups) but the code is very much WIP.
 Finetuning of Stories 260K and LLaMA 3.2 1b seems to work with 24 GB of memory.
-**For CPU training, compile llama.cpp without any additional backends such as CUDA.**
-**For CUDA training, use the maximum number of GPU layers.**
+**For CPU training, compile llama.cpp without any additional backends such as HIP.**
+**For GPU (HIP) training, use the maximum number of GPU layers.**
 
 Flash attention is disabled during training because `FLASH_ATTN_EXT` has no backward pass.
 

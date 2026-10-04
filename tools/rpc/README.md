@@ -14,15 +14,15 @@ flowchart TD
     rpcb<-->|TCP|srvb
     rpcb<-.->|TCP|srvn
     subgraph hostn[Host N]
-    srvn[ggml-rpc-server]<-.->dev4["CUDA0"]
+    srvn[ggml-rpc-server]<-.->dev4["ROCm0"]
     srvn[ggml-rpc-server]<-.->dev5["CPU"]
     end
     subgraph hostb[Host B]
-    srvb[ggml-rpc-server]<-->dev3["Metal"]
+    srvb[ggml-rpc-server]<-->dev3["CPU"]
     end
     subgraph hosta[Host A]
-    srva[ggml-rpc-server]<-->dev["CUDA0"]
-    srva[ggml-rpc-server]<-->dev2["CUDA1"]
+    srva[ggml-rpc-server]<-->dev["ROCm0"]
+    srva[ggml-rpc-server]<-->dev2["ROCm1"]
     end
     subgraph host[Main Host]
     local["Local devices"]<-->ggml[llama-cli]
@@ -41,34 +41,29 @@ If there are no accelerators, it exposes a single `CPU` device.
 ### Remote hosts
 
 On each remote host, build the backends for each accelerator by adding `-DGGML_RPC=ON` to the build options.
-For example, to build the `ggml-rpc-server` with support for CUDA accelerators:
+For example, to build the `ggml-rpc-server` with support for ROCm (MI100 / gfx908) accelerators:
 
 ```bash
-mkdir build-rpc-cuda
-cd build-rpc-cuda
-cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON
-cmake --build . --config Release
+cmake -B build-rpc-rocm -DGGML_HIP=ON -DGPU_TARGETS=gfx908 -DGGML_RPC=ON
+cmake --build build-rpc-rocm --config Release -j
 ```
 
-When started, the `ggml-rpc-server` will detect and expose all available `CUDA` devices:
+When started, the `ggml-rpc-server` will detect and expose all available `ROCm` devices (output abbreviated):
 
 ```bash
 $ bin/ggml-rpc-server
-ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
-ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
-ggml_cuda_init: found 1 CUDA devices:
-  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes
+...
 Starting RPC server v3.0.0
   endpoint       : 127.0.0.1:50052
   local cache    : n/a
 Devices:
-  CUDA0: NVIDIA GeForce RTX 5090 (32109 MiB, 31588 MiB free)
+  ROCm0: AMD Instinct MI100 (...)
 ```
 
-You can control the set of exposed CUDA devices with the `CUDA_VISIBLE_DEVICES` environment variable or the `--device` command line option. The following two commands have the same effect:
+You can control the set of exposed ROCm devices with the `HIP_VISIBLE_DEVICES` environment variable or the `--device` command line option. The following two commands have the same effect:
 ```bash
-$ CUDA_VISIBLE_DEVICES=0 bin/ggml-rpc-server -p 50052
-$ bin/ggml-rpc-server --device CUDA0 -p 50052
+$ HIP_VISIBLE_DEVICES=0 bin/ggml-rpc-server -p 50052
+$ bin/ggml-rpc-server --device ROCm0 -p 50052
 ```
 
 ### Main host

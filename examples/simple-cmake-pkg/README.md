@@ -8,7 +8,7 @@ Because this example is "outside of the source tree", it is important to first b
 
 ### Considerations
 
-When hardware acceleration libraries are used (e.g. CUDA, Metal, Vulkan, etc.), the appropriate dependencies will be searched for automatically. So, for example, when finding a package
+When hardware acceleration libraries are used (e.g. HIP/ROCm, BLAS, etc.), the appropriate dependencies will be searched for automatically. So, for example, when finding a package
 
 ### Build llama.cpp and install to llama.cpp/inst
 

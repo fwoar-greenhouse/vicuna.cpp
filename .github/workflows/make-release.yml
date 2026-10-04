@@ -142,7 +142,7 @@ jobs:
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-          VARIANTS=("" "-cuda" "-cuda13" "-vulkan" "-rocm" "-intel" "-musa" "-openvino")
+          VARIANTS=("" "-rocm")
           TYPES=("full" "light" "server")
           for type in "${TYPES[@]}"; do
             for variant in "${VARIANTS[@]}"; do

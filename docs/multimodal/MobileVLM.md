@@ -191,59 +191,6 @@ llama_print_timings:        eval time =   14497.49 ms /   186 runs   (   77.94 m
 llama_print_timings:       total time =   44411.01 ms /   377 tokens
 ```
 
-## Orin compile and run
-### compile
-```sh
-make GGML_CUDA=1 CUDA_DOCKER_ARCH=sm_87 -j 32
-```
-### run on Orin
-### case 1
-**input**
-```sh
-./llama-mtmd-cli \
-    -m /data/local/tmp/ggml-model-q4_k.gguf \
-    --mmproj /data/local/tmp/mmproj-model-f16.gguf \
-    --image /data/local/tmp/demo.jpeg \
-    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWho is the author of this book? \nAnswer the question using a single word or phrase. ASSISTANT:" \
-    --n-gpu-layers 999
-```
-**output**
-```sh
-
-encode_image_with_clip: image encoded in   296.62 ms by CLIP (    2.06 ms per image patch)
-
- Susan Wise Bauer
-
-llama_print_timings:        load time =    1067.64 ms
-llama_print_timings:      sample time =       1.53 ms /     6 runs   (    0.25 ms per token,  3934.43 tokens per second)
-llama_print_timings: prompt eval time =     306.84 ms /   246 tokens (    1.25 ms per token,   801.72 tokens per second)
-llama_print_timings:        eval time =      91.50 ms /     6 runs   (   15.25 ms per token,    65.58 tokens per second)
-llama_print_timings:       total time =    1352.63 ms /   252 tokens
-```
-
-### case 2
-**input**
-```sh
-./llama-mtmd-cli \
-    -m /data/local/tmp/ggml-model-q4_k.gguf \
-    --mmproj /data/local/tmp/mmproj-model-f16.gguf \
-    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWhat is in the image? ASSISTANT:" \
-    --n-gpu-layers 999
-
-```
-**output**
-```sh
-encode_image_with_clip: image encoded in   302.15 ms by CLIP (    2.10 ms per image patch)
-
- The image features a cat lying in the grass.
-
-llama_print_timings:        load time =    1057.07 ms
-llama_print_timings:      sample time =       3.27 ms /    11 runs   (    0.30 ms per token,  3360.83 tokens per second)
-llama_print_timings: prompt eval time =     213.60 ms /   232 tokens (    0.92 ms per token,  1086.14 tokens per second)
-llama_print_timings:        eval time =     166.65 ms /    11 runs   (   15.15 ms per token,    66.01 tokens per second)
-llama_print_timings:       total time =    1365.47 ms /   243 tokens
-```
-
 ## Running on Intel(R) Core(TM) i7-10750H
 ### Operating system
 Ubuntu22.04

@@ -17,8 +17,6 @@ LLAMA_BUILD_TOOLS=OFF
 LLAMA_BUILD_TESTS=OFF
 LLAMA_BUILD_SERVER=OFF
 LLAMA_BUILD_MTMD=ON
-GGML_METAL=ON
-GGML_METAL_EMBED_LIBRARY=${GGML_METAL_EMBED_LIBRARY:-ON}
 GGML_BLAS_DEFAULT=ON
 GGML_OPENMP=OFF
 
@@ -80,9 +78,7 @@ COMMON_CMAKE_ARGS=(
     -DLLAMA_BUILD_TESTS=${LLAMA_BUILD_TESTS}
     -DLLAMA_BUILD_SERVER=${LLAMA_BUILD_SERVER}
     -DLLAMA_BUILD_MTMD=${LLAMA_BUILD_MTMD}
-    -DGGML_METAL_EMBED_LIBRARY=${GGML_METAL_EMBED_LIBRARY}
     -DGGML_BLAS_DEFAULT=${GGML_BLAS_DEFAULT}
-    -DGGML_METAL=${GGML_METAL}
     -DGGML_NATIVE=OFF
     -DGGML_OPENMP=${GGML_OPENMP}
 )
@@ -162,20 +158,11 @@ setup_framework_structure() {
     cp ggml/include/ggml-opt.h     ${header_path}
     cp ggml/include/ggml-alloc.h   ${header_path}
     cp ggml/include/ggml-backend.h ${header_path}
-    cp ggml/include/ggml-metal.h   ${header_path}
     cp ggml/include/ggml-cpu.h     ${header_path}
     cp ggml/include/ggml-blas.h    ${header_path}
     cp ggml/include/gguf.h         ${header_path}
     cp tools/mtmd/mtmd.h           ${header_path}
     cp tools/mtmd/mtmd-helper.h    ${header_path}
-
-    if [[ "$GGML_METAL_EMBED_LIBRARY" == "OFF" ]]; then
-        if [[ "$platform" == "macos" ]]; then
-            cp ${build_dir}/bin/*.metallib ${build_dir}/framework/${framework_name}.framework/Versions/A/Resources/
-        else
-            cp ${build_dir}/bin/*.metallib ${build_dir}/framework/${framework_name}.framework/
-        fi
-    fi
 
     # Create module map (common for all platforms)
     cat > ${module_path}module.modulemap << EOF
@@ -184,7 +171,6 @@ framework module llama {
 
     link "c++"
     link framework "Accelerate"
-    link framework "Metal"
     link framework "Foundation"
 
     export *
@@ -295,7 +281,6 @@ combine_static_libraries() {
         "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml.a"
         "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml-base.a"
         "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml-cpu.a"
-        "${base_dir}/${build_dir}/ggml/src/ggml-metal/${release_dir}/libggml-metal.a"
         "${base_dir}/${build_dir}/ggml/src/ggml-blas/${release_dir}/libggml-blas.a"
         "${base_dir}/${build_dir}/tools/mtmd/${release_dir}/libmtmd.a"
         "${base_dir}/${build_dir}/vendor/hash/${release_dir}/libvendor-hash.a"
@@ -374,7 +359,7 @@ combine_static_libraries() {
         $arch_flags \
         $min_version_flag \
         -Wl,-force_load,"${temp_dir}/combined.a" \
-        -framework Foundation -framework Metal -framework Accelerate \
+        -framework Foundation -framework Accelerate \
         -install_name "$install_name" \
         -o "${base_dir}/${output_lib}"
 
@@ -458,7 +443,6 @@ build_ios_sim() {
         -DIOS=ON \
         -DCMAKE_SYSTEM_NAME=iOS \
         -DCMAKE_OSX_SYSROOT=iphonesimulator \
-        -DGGML_METAL_TARGET_OS=ios \
         -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
         -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=iphonesimulator \
         -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
@@ -476,7 +460,6 @@ build_ios_device() {
         -DCMAKE_OSX_DEPLOYMENT_TARGET=${IOS_MIN_OS_VERSION} \
         -DCMAKE_SYSTEM_NAME=iOS \
         -DCMAKE_OSX_SYSROOT=iphoneos \
-        -DGGML_METAL_TARGET_OS=ios \
         -DCMAKE_OSX_ARCHITECTURES="arm64" \
         -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=iphoneos \
         -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
@@ -508,7 +491,6 @@ build_visionos() {
         -DCMAKE_OSX_ARCHITECTURES="arm64" \
         -DCMAKE_SYSTEM_NAME=visionOS \
         -DCMAKE_OSX_SYSROOT=xros \
-        -DGGML_METAL_TARGET_OS=xros \
         -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=xros \
         -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
         -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
@@ -527,7 +509,6 @@ build_visionos_sim() {
         -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
         -DCMAKE_SYSTEM_NAME=visionOS \
         -DCMAKE_OSX_SYSROOT=xrsimulator \
-        -DGGML_METAL_TARGET_OS=xros \
         -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=xrsimulator \
         -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
         -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
@@ -546,9 +527,7 @@ build_tvos_sim() {
         -DCMAKE_OSX_DEPLOYMENT_TARGET=${TVOS_MIN_OS_VERSION} \
         -DCMAKE_SYSTEM_NAME=tvOS \
         -DCMAKE_OSX_SYSROOT=appletvsimulator \
-        -DGGML_METAL_TARGET_OS=tvos \
         -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
-        -DGGML_METAL=ON \
         -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=appletvsimulator \
         -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
         -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
@@ -565,9 +544,7 @@ build_tvos_device() {
         -DCMAKE_OSX_DEPLOYMENT_TARGET=${TVOS_MIN_OS_VERSION} \
         -DCMAKE_SYSTEM_NAME=tvOS \
         -DCMAKE_OSX_SYSROOT=appletvos \
-        -DGGML_METAL_TARGET_OS=tvos \
         -DCMAKE_OSX_ARCHITECTURES="arm64" \
-        -DGGML_METAL=ON \
         -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=appletvos \
         -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
         -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \

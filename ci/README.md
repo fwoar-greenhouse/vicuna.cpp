@@ -12,15 +12,8 @@ mkdir tmp
 # CPU-only build
 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
-# with CUDA support
-GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-
-# with SYCL support
-source /opt/intel/oneapi/setvars.sh
-GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-
-# with MUSA support
-GG_BUILD_MUSA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+# with ROCm support (MI100 / gfx908)
+GG_BUILD_ROCM=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
 # etc.
 ```

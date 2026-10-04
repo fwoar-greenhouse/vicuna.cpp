@@ -14,15 +14,13 @@ on:
       '**/*.c',
       '**/*.cpp',
       '**/*.swift',
-      '**/*.m',
-      '**/*.metal'
+      '**/*.m'
     ]
 
   pull_request:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-apple.yml',
-      'ggml/src/ggml-metal/**',
       'ggml/src/ggml-rpc/**'
     ]
 
@@ -70,8 +68,6 @@ jobs:
             -DCMAKE_BUILD_RPATH="@loader_path" \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
-            -DGGML_METAL_EMBED_LIBRARY=OFF \
-            -DGGML_METAL_SHADER_DEBUG=ON \
             -DGGML_RPC=ON \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
           time cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
@@ -92,7 +88,7 @@ jobs:
         run: |
           cmd=(./build/bin/test-thread-safety -hf ggml-org/gemma-3-270m-qat-GGUF -ngl 99 -p "$(printf 'hello %.0s' {1..128})" -n 16 -c 512 -ub 32 -np 2 -t 2 -lv 1)
           leaks -atExit -- "${cmd[@]}"
-          # Graphics devices are leaked by Metal in Apple code sometimes, so we ignore those leaks
+          # Graphics devices are sometimes leaked by Apple code, so we ignore those leaks
           OBJC_DEBUG_MISSING_POOLS=YES "${cmd[@]}" 2>&1 | awk '{ print } index($0, "autoreleased with no pool in place") && !/class [a-zA-Z0-9]+Device autoreleased/ { found = 1 } END { exit found }'
 
       - name: Test
@@ -129,13 +125,10 @@ jobs:
         id: cmake_build
         run: |
           sysctl -a
-          # Metal is disabled due to intermittent failures with Github runners not having a GPU:
-          # https://github.com/ggml-org/llama.cpp/actions/runs/8635935781/job/23674807267#step:5:2313
           cmake -B build \
             -DCMAKE_BUILD_RPATH="@loader_path" \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
-            -DGGML_METAL=OFF \
             -DGGML_RPC=ON \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
           time cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
@@ -175,7 +168,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_OPENSSL=OFF \
             -DLLAMA_BUILD_APP=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
@@ -217,7 +209,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_BUILD_COMMON=OFF \
             -DLLAMA_BUILD_APP=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
@@ -242,7 +233,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_BUILD_COMMON=OFF \
             -DLLAMA_BUILD_APP=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
@@ -278,7 +268,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_OPENSSL=OFF \
             -DLLAMA_BUILD_APP=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \

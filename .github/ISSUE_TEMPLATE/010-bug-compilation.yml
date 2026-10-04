@@ -43,7 +43,7 @@ body:
     attributes:
         label: GGML backends
         description: Which GGML backends do you know to be affected?
-        options: [AMX, BLAS, CANN, CPU, CUDA, Hexagon, HIP, Metal, Musa, OpenCL, OpenVINO, RPC, SYCL, VirtGPU, Vulkan, WebGPU, zDNN, ZenDNN]
+        options: [AMX, BLAS, CPU, HIP, RPC]
         multiple: true
     validations:
       required: true
@@ -55,7 +55,7 @@ body:
         Please give us a summary of the problem and tell us how to reproduce it.
         If you can narrow down the bug to specific compile flags, that information would be very much appreciated by us.
       placeholder: >
-        I'm trying to compile llama.cpp with CUDA support on a fresh install of Ubuntu and get error XY.
+        I'm trying to compile llama.cpp with HIP support on a fresh install of Ubuntu and get error XY.
         Here are the exact commands that I used: ...
     validations:
       required: true

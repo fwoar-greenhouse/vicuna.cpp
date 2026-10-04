@@ -450,8 +450,8 @@ You can consume the endpoints with Postman or NodeJS with axios library. You can
 ```bash
 docker run -p 8080:8080 -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:server -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080
 
-# or, with CUDA:
-docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/llama.cpp:server-cuda -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080 --n-gpu-layers 99
+# or, with ROCm:
+docker run -p 8080:8080 -v /path/to/models:/models --device /dev/kfd --device /dev/dri --group-add video ghcr.io/ggml-org/llama.cpp:server-rocm -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080 --n-gpu-layers 99
 ```
 
 ## Using with CURL

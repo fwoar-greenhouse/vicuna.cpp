@@ -9,7 +9,7 @@ Adding a model requires few steps:
 
 After following these steps, you can open PR.
 
-Also, it is important to check that the examples and main ggml backends (CUDA, METAL, CPU) are working with the new architecture, especially:
+Also, it is important to check that the examples and main ggml backends (HIP, CPU) are working with the new architecture, especially:
 - [cli](/tools/cli/)
 - [completion](/tools/completion/)
 - [imatrix](/tools/imatrix/)

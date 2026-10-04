@@ -13,32 +13,14 @@ We have three Docker images available for this project:
 
 Additionally, there the following images, similar to the above:
 
-- `ghcr.io/ggml-org/llama.cpp:full-cuda`: Same as `full` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggml-org/llama.cpp:full-cuda13`: Same as `full` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggml-org/llama.cpp:light-cuda`: Same as `light` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggml-org/llama.cpp:light-cuda13`: Same as `light` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggml-org/llama.cpp:server-cuda`: Same as `server` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggml-org/llama.cpp:server-cuda13`: Same as `server` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
 - `ghcr.io/ggml-org/llama.cpp:full-rocm`: Same as `full` but compiled with ROCm support. (platforms: `linux/amd64`)
 - `ghcr.io/ggml-org/llama.cpp:light-rocm`: Same as `light` but compiled with ROCm support. (platforms: `linux/amd64`)
 - `ghcr.io/ggml-org/llama.cpp:server-rocm`: Same as `server` but compiled with ROCm support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:full-musa`: Same as `full` but compiled with MUSA support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:light-musa`: Same as `light` but compiled with MUSA support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:server-musa`: Same as `server` but compiled with MUSA support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:full-intel`: Same as `full` but compiled with SYCL support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:light-intel`: Same as `light` but compiled with SYCL support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:server-intel`: Same as `server` but compiled with SYCL support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:full-vulkan`: Same as `full` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggml-org/llama.cpp:light-vulkan`: Same as `light` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggml-org/llama.cpp:server-vulkan`: Same as `server` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/ggml-org/llama.cpp:full-openvino`: Same as `full` but compiled with OpenVino support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:light-openvino`: Same as `light` but compiled with OpenVino support. (platforms: `linux/amd64`)
-- `ghcr.io/ggml-org/llama.cpp:server-openvino`: Same as `server` but compiled with OpenVino support. (platforms: `linux/amd64`)
 - `ghcr.io/ggml-org/llama.cpp:full-s390x`: Identical to `full`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
 - `ghcr.io/ggml-org/llama.cpp:light-s390x`: Identical to `light`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
 - `ghcr.io/ggml-org/llama.cpp:server-s390x`: Identical to `server`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
 
-The GPU enabled images are not currently tested by CI beyond being built. They are not built with any variation from the ones in the Dockerfiles defined in [.devops/](../.devops/) and the GitHub Action defined in [.github/workflows/docker.yml](../.github/workflows/docker.yml). If you need different settings (for example, a different CUDA, ROCm or MUSA library, you'll need to build the images locally for now).
+The GPU enabled images are not currently tested by CI beyond being built. They are not built with any variation from the ones in the Dockerfiles defined in [.devops/](../.devops/) and the GitHub Action defined in [.github/workflows/docker.yml](../.github/workflows/docker.yml). If you need different settings (for example, a different ROCm version or GPU target), you'll need to build the images locally for now.
 
 ## Usage
 
@@ -72,107 +54,37 @@ docker run -v /path/to/models:/models -p 8080:8080 ghcr.io/ggml-org/llama.cpp:se
 
 In the above examples, `--entrypoint /app/llama-cli` is specified for clarity, but you can safely omit it since it's the default entrypoint in the container.
 
-## Docker With CUDA
+## Docker With ROCm
 
-Assuming one has the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) properly installed on Linux, or is using a GPU enabled cloud, `cuBLAS` should be accessible inside the container.
+The ROCm image targets the AMD Instinct MI100 (`gfx908`). The host needs the `amdgpu` kernel driver installed so that `/dev/kfd` and `/dev/dri` are available.
 
 ## Building Docker locally
 
 ```bash
-docker build -t local/llama.cpp:full-cuda --target full -f .devops/cuda.Dockerfile .
-docker build -t local/llama.cpp:light-cuda --target light -f .devops/cuda.Dockerfile .
-docker build -t local/llama.cpp:server-cuda --target server -f .devops/cuda.Dockerfile .
+docker build -t local/llama.cpp:full-rocm --target full -f .devops/rocm.Dockerfile .
+docker build -t local/llama.cpp:light-rocm --target light -f .devops/rocm.Dockerfile .
+docker build -t local/llama.cpp:server-rocm --target server -f .devops/rocm.Dockerfile .
 ```
 
-You may want to pass in some different `ARGS`, depending on the CUDA environment supported by your container host, as well as the GPU architecture.
+You may want to pass in some different `ARGS`, depending on the ROCm environment supported by your container host.
 
 The defaults are:
 
-- `CUDA_VERSION` set to `12.8.1`
-- `CUDA_DOCKER_ARCH` set to the cmake build default, which includes all the supported architectures
+- `ROCM_VERSION` set to `7.2.1`
+- `ROCM_DOCKER_ARCH` set to `gfx908`
 
-The resulting images, are essentially the same as the non-CUDA images:
+The resulting images are essentially the same as the CPU images:
 
-1. `local/llama.cpp:full-cuda`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization.
-2. `local/llama.cpp:light-cuda`: This image only includes the `llama-cli` and `llama-completion` executables.
-3. `local/llama.cpp:server-cuda`: This image only includes the `llama-server` executable.
-
-## Usage
-
-After building locally, Usage is similar to the non-CUDA examples, but you'll need to add the `--gpus` flag. You will also want to use the `--n-gpu-layers` flag.
-
-```bash
-docker run --gpus all -v /path/to/models:/models local/llama.cpp:full-cuda --run -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
-docker run --gpus all -v /path/to/models:/models local/llama.cpp:light-cuda -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
-docker run --gpus all -v /path/to/models:/models local/llama.cpp:server-cuda -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512 --n-gpu-layers 1
-```
-
-## Docker With MUSA
-
-Assuming one has the [mt-container-toolkit](https://developer.mthreads.com/musa/native) properly installed on Linux, `muBLAS` should be accessible inside the container.
-
-## Building Docker locally
-
-```bash
-docker build -t local/llama.cpp:full-musa --target full -f .devops/musa.Dockerfile .
-docker build -t local/llama.cpp:light-musa --target light -f .devops/musa.Dockerfile .
-docker build -t local/llama.cpp:server-musa --target server -f .devops/musa.Dockerfile .
-```
-
-You may want to pass in some different `ARGS`, depending on the MUSA environment supported by your container host, as well as the GPU architecture.
-
-The defaults are:
-
-- the base image is the MUSA 5.2.0 image from the Moore Threads registry
-
-The resulting images, are essentially the same as the non-MUSA images:
-
-1. `local/llama.cpp:full-musa`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization.
-2. `local/llama.cpp:light-musa`: This image only includes the `llama-cli` and `llama-completion` executables.
-3. `local/llama.cpp:server-musa`: This image only includes the `llama-server` executable.
+1. `local/llama.cpp:full-rocm`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization.
+2. `local/llama.cpp:light-rocm`: This image only includes the `llama-cli` and `llama-completion` executables.
+3. `local/llama.cpp:server-rocm`: This image only includes the `llama-server` executable.
 
 ## Usage
 
-After building locally, Usage is similar to the non-MUSA examples, but you'll need to set `mthreads` as default Docker runtime. This can be done by executing `(cd /usr/bin/musa && sudo ./docker setup $PWD)` and verifying the changes by executing `docker info | grep mthreads` on the host machine. You will also want to use the `--n-gpu-layers` flag.
+After building locally, usage is similar to the CPU examples, but you'll need to pass the GPU devices into the container. You will also want to use the `--n-gpu-layers` flag.
 
 ```bash
-docker run -v /path/to/models:/models local/llama.cpp:full-musa --run -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
-docker run -v /path/to/models:/models local/llama.cpp:light-musa -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
-docker run -v /path/to/models:/models local/llama.cpp:server-musa -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512 --n-gpu-layers 1
+docker run --device /dev/kfd --device /dev/dri --group-add video -v /path/to/models:/models local/llama.cpp:full-rocm --run -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 99
+docker run --device /dev/kfd --device /dev/dri --group-add video -v /path/to/models:/models local/llama.cpp:light-rocm -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 99
+docker run --device /dev/kfd --device /dev/dri --group-add video -v /path/to/models:/models -p 8080:8080 local/llama.cpp:server-rocm -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512 --n-gpu-layers 99
 ```
-
-## Docker With SYCL
-
-## Building Docker locally
-
-```bash
-docker build -t local/llama.cpp:full-intel --target full -f .devops/intel.Dockerfile .
-docker build -t local/llama.cpp:light-intel --target light -f .devops/intel.Dockerfile .
-docker build -t local/llama.cpp:server-intel --target server -f .devops/intel.Dockerfile .
-```
-
-You may want to pass in some different `ARGS`, depending on the SYCL environment supported by your container host, as well as the GPU architecture.
-Refer to [.devops/intel.Dockerfile](../.devops/intel.Dockerfile) for the available `ARGS` and their defaults.
-
-The resulting images, are essentially the same as the non-SYCL images:
-
-1. `local/llama.cpp:full-intel`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization.
-2. `local/llama.cpp:light-intel`: This image only includes the `llama-cli` and `llama-completion` executables.
-3. `local/llama.cpp:server-intel`: This image only includes the `llama-server` executable.
-
-## Usage
-
-After building locally, usage is similar to the non-SYCL examples, but you'll need to add the `--device` flag.
-
-```bash
-# First, find all the DRI cards
-ls -la /dev/dri
-# Then, pick the card that you want to use (here for e.g. /dev/dri/card0).
-docker run --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card0:/dev/dri/card0 -v /path/to/models:/models local/llama.cpp:full-intel -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 99
-docker run --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card0:/dev/dri/card0 -v /path/to/models:/models local/llama.cpp:light-intel -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 99
-docker run --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card0:/dev/dri/card0 -v /path/to/models:/models local/llama.cpp:server-intel -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512 --n-gpu-layers 99
-```
-
-*Notes:*
-- Docker has been tested successfully on native Linux. WSL support has not been verified yet.
-- You may need to install Intel GPU driver on the **host** machine *(Please refer to the [Linux configuration](./backend/SYCL.md#linux) for details)*.
