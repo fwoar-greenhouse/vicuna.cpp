@@ -13,17 +13,6 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_vec_get_nwarps() {
     return 4;
 }
 
-// The quantized blocks are only 2 or 4 byte aligned, gfx9 can do unaligned VRAM loads.
-template <int nbytes>
-static __device__ __forceinline__ void ggml_cuda_fattn_vec_load_unaligned(void * __restrict__ dst, const void * __restrict__ src) {
-    __builtin_memcpy(dst, src, nbytes);
-}
-
-// Spread 4 bits of vh to bit 4 of each byte.
-static __device__ __forceinline__ uint32_t ggml_cuda_fattn_vec_qh_to_bytes(const uint32_t vh) {
-    return ((vh << 4) & 0x00000010) | ((vh << 11) & 0x00001000) | ((vh << 18) & 0x00100000) | ((vh << 25) & 0x10000000);
-}
-
 // Quantized values are loaded as unsigned bytes q, value = (q - bias)*d + m.
 template <ggml_type type>
 static constexpr __device__ int ggml_cuda_fattn_vec_q_bias() {
@@ -52,7 +41,7 @@ static __device__ __forceinline__ void ggml_cuda_fattn_vec_load_q(
         const char * __restrict__ row, const int v0, ggml_cuda_fattn_vec_q_raw<type, nv> & raw) {
     if constexpr (type == GGML_TYPE_Q8_0) {
         const block_q8_0 * x = (const block_q8_0 *) row + v0/QK8_0;
-        ggml_cuda_fattn_vec_load_unaligned<nv>(raw.qs, x->qs + v0 % QK8_0);
+        ggml_cuda_fattn_load_unaligned<nv>(raw.qs, x->qs + v0 % QK8_0);
         raw.dm = __halves2half2(x->d, x->d);
     } else {
         // 4/5 bit types: values 0-15 of a block are in the low nibbles, values 16-31 in the high nibbles.
@@ -62,9 +51,9 @@ static __device__ __forceinline__ void ggml_cuda_fattn_vec_load_q(
                                  (type == GGML_TYPE_Q5_0 ? sizeof(block_q5_0) : sizeof(block_q5_1)));
         const char * x = row + (v0/32)*nbytes;
 
-        ggml_cuda_fattn_vec_load_unaligned<4*ggml_cuda_fattn_vec_q_raw<type, nv>::nw>(raw.qs, x + qs_offset + (nv < 32 ? v0 % 16 : 0));
+        ggml_cuda_fattn_load_unaligned<4*ggml_cuda_fattn_vec_q_raw<type, nv>::nw>(raw.qs, x + qs_offset + (nv < 32 ? v0 % 16 : 0));
         if constexpr (type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1) {
-            ggml_cuda_fattn_vec_load_unaligned<4>(&raw.qh, x + qs_offset - 4);
+            ggml_cuda_fattn_load_unaligned<4>(&raw.qh, x + qs_offset - 4);
         }
         if constexpr (ggml_cuda_fattn_vec_q_has_min<type>()) {
             raw.dm = *(const half2 *) x;
@@ -101,7 +90,7 @@ static __device__ __forceinline__ void ggml_cuda_fattn_vec_unpack_q(
             const uint32_t qh = raw.qh >> (v0 % 32);
 #pragma unroll
             for (int l = 0; l < nv/4; ++l) {
-                q[l] |= ggml_cuda_fattn_vec_qh_to_bytes(qh >> (4*l));
+                q[l] |= ggml_cuda_fattn_qh_to_bytes(qh >> (4*l));
             }
         }
     }
@@ -146,6 +135,7 @@ static __global__ void flash_attn_ext_vec(
         const float m1,
         const uint32_t n_head_log2,
         const float logit_softcap,
+        const int32_t type_K_data, const int32_t type_V_data,
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
@@ -167,7 +157,7 @@ static __global__ void flash_attn_ext_vec(
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
-            max_bias, m0, m1, n_head_log2, logit_softcap,
+            max_bias, m0, m1, n_head_log2, logit_softcap, type_K_data, type_V_data,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
             ne10, ne11, ne12, ne13,
@@ -550,7 +540,7 @@ static __global__ void flash_attn_ext_vec(
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
-        max_bias, m0, m1, n_head_log2, logit_softcap,
+        max_bias, m0, m1, n_head_log2, logit_softcap, type_K_data, type_V_data,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
         ne10, ne11, ne12, ne13,

@@ -9,7 +9,8 @@ template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
-    if constexpr (ncols2 <= 16) {
+    // For DKQ > 256 the kernel needs at least 32 Q columns.
+    if constexpr (ncols2 <= 16 && DKQ <= 256) {
         if (Q->ne[1] <= 16/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
@@ -410,6 +411,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
+    // The MMA kernel converts quantized K/V while loading tiles, the tile kernel would need a converted copy of all of K/V:
+    if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && Q->ne[0] % 64 == 0 && V->ne[0] % 64 == 0) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
     if (Q->ne[0] != 40 && Q->ne[0] != 72) {
         if ((Q->ne[0] <= 64 && Q->ne[1] * gqa_ratio_eff > 8)) {
@@ -452,9 +458,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = ggml_cuda_fattn_mma_need_f16(K->type, K->ne[0]);
+            need_f16_V = ggml_cuda_fattn_mma_need_f16(V->type, V->ne[0]);
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;

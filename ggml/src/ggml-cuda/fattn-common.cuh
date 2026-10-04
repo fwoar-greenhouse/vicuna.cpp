@@ -33,6 +33,7 @@ typedef void (* fattn_kernel_t)(
         const float m1,
         const uint32_t n_head_log2,
         const float logit_softcap,
+        const int32_t type_K_data, const int32_t type_V_data,
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
@@ -123,6 +124,17 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
             ((float2 *) yds)[threadIdx.x/QI8_1] = make_float2(d, sum);
         }
     }
+}
+
+// The quantized blocks are only 2 or 4 byte aligned, gfx9 can do unaligned VRAM loads.
+template <int nbytes>
+static __device__ __forceinline__ void ggml_cuda_fattn_load_unaligned(void * __restrict__ dst, const void * __restrict__ src) {
+    __builtin_memcpy(dst, src, nbytes);
+}
+
+// Spread 4 bits of vh to bit 4 of each byte.
+static __device__ __forceinline__ uint32_t ggml_cuda_fattn_qh_to_bytes(const uint32_t vh) {
+    return ((vh << 4) & 0x00000010) | ((vh << 11) & 0x00001000) | ((vh << 18) & 0x00100000) | ((vh << 25) & 0x10000000);
 }
 
 typedef void (*dequantize_V_t)(const void *, void *, const int64_t);
@@ -954,6 +966,7 @@ void launch_fattn(
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+        need_f16_K ? GGML_TYPE_F16 : K->type, need_f16_V ? GGML_TYPE_F16 : V->type,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
