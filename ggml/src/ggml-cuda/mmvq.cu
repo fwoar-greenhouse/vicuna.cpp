@@ -64,6 +64,22 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+// Same result as warp_reduce_sum<64> (same pairs, same order), with fewer ds_bpermute round trips.
+static __device__ __forceinline__ float mmvq_warp_reduce_sum(float x) {
+#if defined(GGML_USE_HIP) && defined(CDNA)
+    x += __shfl_xor(x, 32, 64);
+    // ds_swizzle bit mode: offset = and_mask | or_mask << 5 | xor_mask << 10, within 32 lanes
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x1F | (16 << 10)));
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x1F | ( 8 << 10)));
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x1F | ( 4 << 10)));
+    x += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0x4E, 0xF, 0xF, false)); // quad_perm [2,3,0,1]
+    x += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0xB1, 0xF, 0xF, false)); // quad_perm [1,0,3,2]
+    return x;
+#else
+    return warp_reduce_sum<ggml_cuda_get_physical_warp_size()>(x);
+#endif
+}
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_GCN,
@@ -389,10 +405,10 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            tmp[j][i] = mmvq_warp_reduce_sum(tmp[j][i]);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+                    tmp_gate[j][i] = mmvq_warp_reduce_sum(tmp_gate[j][i]);
                 }
             }
 
@@ -531,10 +547,10 @@ static __global__ void mul_mat_vec_q_moe(
     // Warp-level reduction only - no shared memory needed
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        tmp[i] = mmvq_warp_reduce_sum(tmp[i]);
         if constexpr (has_fusion) {
             if (use_gate) {
-                tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+                tmp_gate[i] = mmvq_warp_reduce_sum(tmp_gate[i]);
             }
         }
     }
