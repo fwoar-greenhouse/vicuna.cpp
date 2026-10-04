@@ -1043,7 +1043,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     }
 
     const int ntiles_dst = ntx * nty * ntzw;
-    const dim3 block_nums_stream_k(nsm, 1, 1);
+    // With few output tiles, more blocks than CUs only split the K loop finer and add fixup work.
+    const dim3 block_nums_stream_k(4*ntiles_dst >= nsm ? nsm*config.occupancy : nsm, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
