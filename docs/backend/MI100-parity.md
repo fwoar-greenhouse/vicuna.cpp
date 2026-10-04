@@ -31,6 +31,22 @@ llama-bench, Qwen3.8-27B UD-Q5_K_S (17.37 GiB), `-ngl 99 -fa 1`, HIP_VISIBLE_DEV
 - With head dim 256, the MFMA FA kernel runs only when ne1 * 6 > 64 (verify width >= 11). Decode and most verify steps use the tile kernel.
 - Throughput drifts down about 1% per few minutes of sustained load. Interleave A/B runs.
 
+### Kernel time profile (rocprofv3 --kernel-trace, llama-bench `-r 1`, tag mi100-pruned-verified)
+
+Share of GPU kernel time by kernel family. "decode" = `-p 0 -n 32`, "batch 16" = `-p 16 -n 0`.
+
+| profile | quantized matmul | rms_norm | quantize_q8_1 | flash attn | other notable |
+|---|---|---:|---:|---:|---|
+| Qwen3.8-27B decode | MMVQ 74.4% | 6.0% | 6.5% | 1.6% | glu 2.5%, GDN 1.7% |
+| Qwen3.8-27B batch 16 | MMQ 74.2% | 2.8% | 3.8% | 1.4% | GDN 5.5% |
+| Gemma 4 31B decode | MMVQ 78.0% | 9.5% | 4.4% | 5.4% | |
+| Gemma 4 31B batch 16 | MMQ 78.2% | 5.3% | 3.0% | 7.4% | |
+| Gemma 4 26B-A4B decode | MMVQ 46.0% | 17.6% | 10.3% | 7.4% | top-k 3.5%, binbcast 3.5% |
+| Gemma 4 26B-A4B batch 16 | MMQ 62.7% | 4.8% | 2.9% | 4.5% | MMF 13.9% (200 us per call) |
+
+- Qwen decode runs ~1,900 kernels per token. Small kernels take ~4.5 us each regardless of size, about 7.8 ms per token in total.
+- MMVQ alone reaches ~785 GB/s on Qwen decode (64% of peak). The rest of the gap to the 43% end-to-end figure is small-kernel time.
+
 ## Priority: generic parity first
 
 Goal: bring the gfx908 backend to parity with the CUDA backend across model types before any model-specific tuning.
