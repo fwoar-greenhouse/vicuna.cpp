@@ -11630,6 +11630,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, bs, 2816, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2816, bs, 4096, {1, 1}, {1, 1}));
         }
+        // f32 router
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, bs, 2816, {1, 1}, {1, 1}));
     }
 
     // qwen3-30b-a3b

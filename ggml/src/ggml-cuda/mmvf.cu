@@ -773,7 +773,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
 
     switch (type) {
         case GGML_TYPE_F32:
-            return ne11 <= 3;
+            // MMF is slow on CDNA1 below 7 columns, and for small matrices (few blocks) at any width
+            return ne11 <= 6 || (ne11 <= MMVF_MAX_BATCH_SIZE && src0_ne[1] <= 512);
         case GGML_TYPE_F16:
             return ne11 <= 2;
         case GGML_TYPE_BF16:

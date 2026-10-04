@@ -1769,6 +1769,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // Small f32 matrices (e.g. MoE routers) with 9-16 columns: MMVF in chunks of 8 columns, MMF and hipBLAS have too few blocks
+    if (src0->type == GGML_TYPE_F32 && ne11 > MMVF_MAX_BATCH_SIZE && ne11 <= 16 && ne01 <= 512 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, MMVF_MAX_BATCH_SIZE)) {
+        for (int64_t j0 = 0; j0 < ne11; j0 += MMVF_MAX_BATCH_SIZE) {
+            ggml_tensor src1_chunk = *src1;
+            ggml_tensor dst_chunk  = *dst;
+            src1_chunk.ne[1] = std::min<int64_t>(MMVF_MAX_BATCH_SIZE, ne11 - j0);
+            dst_chunk.ne[1]  = src1_chunk.ne[1];
+            src1_chunk.data  = (char *) src1->data + j0*nb11;
+            dst_chunk.data   = (char *) dst->data  + j0*nb1;
+            ggml_cuda_mul_mat_vec_f(ctx, src0, &src1_chunk, nullptr, &dst_chunk);
+        }
+        return;
+    }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
     if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
             && src0->type == GGML_TYPE_F32
