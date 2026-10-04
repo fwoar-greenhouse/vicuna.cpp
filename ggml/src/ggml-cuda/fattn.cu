@@ -179,6 +179,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE( 64, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(128, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(256, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE(512, type_K_case, type_V_case)       \
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -380,14 +381,27 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
-    // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // 192 and 320 satisfy % 64 == 0 but have no vec instance (DKQ != DV).
+    const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && Q->ne[0] != 320 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
     int gqa_ratio_eff = 1;
     while (max_bias == 0.0f && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
         gqa_ratio_eff *= 2;
+    }
+
+    // For short f16 K/V and 1-2 Q rows the tile kernel has less overhead, if it reads K/V only once (GQA ratio is a power of 2):
+    const bool tile_short_kv = gqa_opt_applies && gqa_ratio == gqa_ratio_eff && K->ne[1] <= 2048;
+
+    // The vector kernel reads quantized K/V directly and works on all Q heads that share a K/V head, use it for decode:
+    if (can_use_vector_kernel) {
+        if (ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) {
+            if (Q->ne[1] <= 2) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
+        } else if (Q->ne[1] == 1 && (Q->ne[0] <= 256 || !gqa_opt_applies) && !tile_short_kv) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
     }
 
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
@@ -407,19 +421,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Otherwise use the generic tile kernel:
-    if (can_use_vector_kernel) {
-        if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-            if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
-            }
-        } else {
-            if (Q->ne[1] <= 2) {
-                return BEST_FATTN_KERNEL_VEC;
-            }
-        }
-    }
     return BEST_FATTN_KERNEL_TILE;
 }
 

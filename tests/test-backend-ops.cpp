@@ -11135,6 +11135,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // decode and small batches (speculative verify) with GQA, quantized and mixed K/V types
+    for (int hs : { 128, 256, 512, }) {
+        for (int nr2 : { 1, 2, 6, 8, }) {
+            for (int nb : { 1, 2, 4, 9, 16, }) {
+                for (auto [type_K, type_V] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+                        {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0},
+                        {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_1, GGML_TYPE_Q5_1}, {GGML_TYPE_Q5_0, GGML_TYPE_BF16},
+                        {GGML_TYPE_BF16, GGML_TYPE_Q4_1}}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                }
+            }
+        }
+    }
+    for (int nb : { 1, 2, 5, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 2048, nb, true, true,  0, 10.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 2048, nb, true, true,  8,  0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {3, 1}, 2048, nb, true, true,  0,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 2048, nb, true, true,  0,  0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
+    }
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -11708,6 +11728,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // decode and small batches (speculative verify) with long KV, GQA 2/6/8, quantized and mixed K/V
+    for (int kv : { 4096, 16384, 65536, }) {
+        for (int nb : { 1, 2, 4, 8, 16, }) {
+            for (auto [type_K, type_V] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+                    {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+            }
+        }
+    }
+    // short KV (sliding window) with many K/V heads
+    for (int kv : { 512, 1024, 1536, 2048, }) {
+        for (int nb : { 1, 2, 16, }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 32, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128,  8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 512, 576, }) {
