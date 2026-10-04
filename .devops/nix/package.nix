@@ -21,6 +21,8 @@
   useRocm ? config.rocmSupport,
   # This fork targets AMD MI100 (CDNA1) only
   rocmGpuTargets ? "gfx908",
+  # FlashAttention K-V type pairs with native kernels; other pairs convert the KV cache to f16
+  rocmFaQuants ? "all",
   useRpc ? false,
   llamaVersion ? "0.0.0", # Arbitrary version, substituted by the flake
   llamaCommit ? "unknown", # Git revision, substituted by the flake
@@ -152,6 +154,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     ++ optionals useRocm [
       (cmakeFeature "CMAKE_HIP_COMPILER" "${rocmPackages.llvm.clang}/bin/clang")
       (cmakeFeature "CMAKE_HIP_ARCHITECTURES" rocmGpuTargets)
+      (cmakeFeature "GGML_CUDA_FA_QUANTS" rocmFaQuants)
     ];
 
   # Environment variables needed for ROCm
