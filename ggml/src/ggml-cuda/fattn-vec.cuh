@@ -562,6 +562,24 @@ static __global__ void flash_attn_ext_vec(
 #endif // defined(FLASH_ATTN_AVAILABLE) && defined(AMD_MFMA_AVAILABLE)
 }
 
+// A CUDA block has 16 Q columns: 16/ncols2 Q rows x ncols2 Q heads that use the same K/V head.
+// Returns the ncols2 with the fewest passes over K/V. Without GQA optimization (ALiBi) use gqa_ratio = 1.
+static int ggml_cuda_fattn_vec_get_ncols2(const int ne1, const int gqa_ratio, int * npasses) {
+    int ncols2_best  = 1;
+    int npasses_best = INT_MAX;
+    for (int ncols2 = 1; ncols2 <= 16; ncols2 *= 2) {
+        const int np = ((ne1 + 16/ncols2 - 1) / (16/ncols2)) * ((gqa_ratio + ncols2 - 1) / ncols2);
+        if (np < npasses_best) {
+            npasses_best = np;
+            ncols2_best  = ncols2;
+        }
+    }
+    if (npasses) {
+        *npasses = npasses_best;
+    }
+    return ncols2_best;
+}
+
 template <int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int nwarps    = ggml_cuda_fattn_vec_get_nwarps();
@@ -594,19 +612,9 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float max_bias;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
-    // A block has 16 Q columns: ncols1 Q rows x ncols2 Q heads, ALiBi needs a slope per head.
-    // Use the split with the fewest passes over K/V.
-    const int ne1       = Q->ne[1];
+    // ALiBi needs a slope per Q head.
     const int gqa_ratio = max_bias == 0.0f ? Q->ne[2] / K->ne[2] : 1;
-    int ncols2_best  = 1;
-    int npasses_best = INT_MAX;
-    for (int ncols2 = 1; ncols2 <= 16; ncols2 *= 2) {
-        const int npasses = ((ne1 + 16/ncols2 - 1) / (16/ncols2)) * ((gqa_ratio + ncols2 - 1) / ncols2);
-        if (npasses < npasses_best) {
-            npasses_best = npasses;
-            ncols2_best  = ncols2;
-        }
-    }
+    const int ncols2_best = ggml_cuda_fattn_vec_get_ncols2(Q->ne[1], gqa_ratio, nullptr);
 
     switch (ncols2_best) {
         case  1: ggml_cuda_flash_attn_ext_vec_case_softcap<D, 16,  1, type_K, type_V>(ctx, dst); break;

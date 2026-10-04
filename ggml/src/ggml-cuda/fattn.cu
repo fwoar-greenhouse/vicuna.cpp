@@ -393,13 +393,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For short f16 K/V and 1-2 Q rows the tile kernel has less overhead, if it reads K/V only once (GQA ratio is a power of 2):
     const bool tile_short_kv = gqa_opt_applies && gqa_ratio == gqa_ratio_eff && K->ne[1] <= 2048;
 
-    // The vector kernel reads quantized K/V directly and works on all Q heads that share a K/V head, use it for decode:
+    // The vector kernel reads quantized K/V directly and works on up to 16 Q columns (Q rows x Q heads that share a K/V head) per pass over K/V.
+    // It beats converting K/V to f16 for small batches, and for f16 K/V it beats the other kernels if there are few passes.
     if (can_use_vector_kernel) {
+        int vec_npasses;
+        ggml_cuda_fattn_vec_get_ncols2(Q->ne[1], max_bias == 0.0f ? gqa_ratio : 1, &vec_npasses);
+        if (max_bias != 0.0f) {
+            vec_npasses *= gqa_ratio; // One pass per Q head.
+        }
         if (ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) {
-            if (Q->ne[1] <= 2) {
+            if (Q->ne[1] <= 16) {
                 return BEST_FATTN_KERNEL_VEC;
             }
-        } else if (Q->ne[1] == 1 && (Q->ne[0] <= 256 || !gqa_opt_applies) && !tile_short_kv) {
+        } else if (Q->ne[0] <= 256 && vec_npasses <= 2 && !(Q->ne[1] <= 2 && tile_short_kv)) {
             return BEST_FATTN_KERNEL_VEC;
         }
     }
@@ -415,9 +421,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if ((Q->ne[0] <= 256 && Q->ne[1] * gqa_ratio_eff > 64)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
-        if (Q->ne[0] > 256 && gqa_opt_applies && Q->ne[1] * gqa_ratio_eff > 128) {
+        if (Q->ne[0] > 256 && gqa_opt_applies && Q->ne[1] * gqa_ratio_eff > 32) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
+    }
+
+    // The vector kernel is faster than the tile kernel for 2-16 Q rows, for D <= 256 also for 1 Q row:
+    if (can_use_vector_kernel && Q->ne[1] <= 16 && (Q->ne[0] <= 256 || Q->ne[1] > 1) && !(Q->ne[1] <= 2 && tile_short_kv)) {
+        return BEST_FATTN_KERNEL_VEC;
     }
 
     // Otherwise use the generic tile kernel:
