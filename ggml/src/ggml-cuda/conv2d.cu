@@ -123,7 +123,7 @@ conv2d_pad_f16(const float * input, half * output, int iw, int ih, int pw, int p
         (unsigned) x < (unsigned) iw && (unsigned) y < (unsigned) ih ? input[(nc * ih + y) * iw + x] : 0.0f);
 }
 
-template <int KW, int KH, bool use_mma>
+template <int KW, int KH>
 static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
                                                 const half * __restrict__ weight,
                                                 float * __restrict__ output,
@@ -167,17 +167,12 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
 #    endif
     [[maybe_unused]] tile_c c[2][2];
 #else
-    if constexpr (use_mma) {
-        NO_DEVICE_CODE;
-        return;
-    }
+    NO_DEVICE_CODE;
+    return;
 #endif
-    constexpr int              RM = 4, RN = BM * BN / (nthreads * RM);
-    [[maybe_unused]] const int simt_m = tid / (BN / RN) * RM, simt_n = tid % (BN / RN) * RN;
-    [[maybe_unused]] float     c_simt[RM][RN] = {};
-    const int                  tiles          = (k_total + BK - 1) / BK;
-    const int                  begin          = int(int64_t(tiles) * split / split_k) * BK;
-    const int                  end            = int(int64_t(tiles) * (split + 1) / split_k) * BK;
+    const int tiles = (k_total + BK - 1) / BK;
+    const int begin = int(int64_t(tiles) * split / split_k) * BK;
+    const int end   = int(int64_t(tiles) * (split + 1) / split_k) * BK;
     for (int k0 = begin; k0 < end; k0 += BK) {
         if (k_total % 8 == 0 && uintptr_t(weight) % 16 == 0) {
 #pragma unroll
@@ -217,77 +212,42 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
             b_s[k][load_lane] = __halves2half2(lo, hi);
         }
         __syncthreads();
-        if constexpr (use_mma) {
 #if defined(AMD_MFMA_AVAILABLE)
 #    pragma unroll
-            for (int k = 0; k < BK; k += 16) {
-                tile_ab a[2], b[2];
+        for (int k = 0; k < BK; k += 16) {
+            tile_ab a[2], b[2];
 #    pragma unroll
-                for (int i = 0; i < 2; ++i) {
-                    load_ldmatrix(a[i], &a_s[wm + 16 * i][k / 2], AS);
-                    load_ldmatrix_trans(b[i], &b_s[k][(wn + 16 * i) / 2], BS);
-                }
-#    pragma unroll
-                for (int i = 0; i < 2; ++i) {
-#    pragma unroll
-                    for (int j = 0; j < 2; ++j) {
-                        mma(c[i][j], a[i], b[j]);
-                    }
-                }
+            for (int i = 0; i < 2; ++i) {
+                load_ldmatrix(a[i], &a_s[wm + 16 * i][k / 2], AS);
+                load_ldmatrix_trans(b[i], &b_s[k][(wn + 16 * i) / 2], BS);
             }
-#endif
-        } else {
-#pragma unroll 4
-            for (int k = 0; k < BK; ++k) {
-                float a[RM], b[RN];
-#pragma unroll
-                for (int i = 0; i < RM; ++i) {
-                    a[i] = __half2float(((const half *) a_s[simt_m + i])[k]);
-                }
-#pragma unroll
-                for (int j = 0; j < RN; ++j) {
-                    b[j] = __half2float(((const half *) b_s[k])[simt_n + j]);
-                }
-#pragma unroll
-                for (int i = 0; i < RM; ++i) {
-#pragma unroll
-                    for (int j = 0; j < RN; ++j) {
-                        c_simt[i][j] += a[i] * b[j];
-                    }
+#    pragma unroll
+            for (int i = 0; i < 2; ++i) {
+#    pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    mma(c[i][j], a[i], b[j]);
                 }
             }
         }
+#endif
         __syncthreads();
     }
-    if constexpr (use_mma) {
 #if defined(AMD_MFMA_AVAILABLE)
 #    pragma unroll
-        for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 2; ++i) {
 #    pragma unroll
-            for (int j = 0; j < 2; ++j) {
+        for (int j = 0; j < 2; ++j) {
 #    pragma unroll
-                for (int l = 0; l < c[i][j].ne; ++l) {
-                    const int co  = m0 + wm + 16 * i + c[i][j].get_i(l);
-                    const int pos = n0 + wn + 16 * j + c[i][j].get_j(l);
-                    if (co < oc && pos < ow * oh) {
-                        output[(int64_t(blockIdx.z) * oc + co) * ow * oh + pos] = c[i][j].x[l];
-                    }
-                }
-            }
-        }
-#endif
-    } else {
-#pragma unroll
-        for (int i = 0; i < RM; ++i) {
-#pragma unroll
-            for (int j = 0; j < RN; ++j) {
-                const int co = m0 + simt_m + i, pos = n0 + simt_n + j;
+            for (int l = 0; l < c[i][j].ne; ++l) {
+                const int co  = m0 + wm + 16 * i + c[i][j].get_i(l);
+                const int pos = n0 + wn + 16 * j + c[i][j].get_j(l);
                 if (co < oc && pos < ow * oh) {
-                    output[(int64_t(blockIdx.z) * oc + co) * ow * oh + pos] = c_simt[i][j];
+                    output[(int64_t(blockIdx.z) * oc + co) * ow * oh + pos] = c[i][j].x[l];
                 }
             }
         }
     }
+#endif
 }
 
 static __global__ void conv2d_reduce_split_k(const float * __restrict__ partial,
@@ -308,7 +268,6 @@ static __global__ void conv2d_reduce_split_k(const float * __restrict__ partial,
     output[i] = sum;
 }
 
-template <bool use_mma>
 static void conv2d_launch_implicit_gemm(const half *        input,
                                         const half *        weight,
                                         float *             output,
@@ -318,11 +277,11 @@ static void conv2d_launch_implicit_gemm(const half *        input,
                                         dim3                block,
                                         cudaStream_t        stream) {
     if (params.KW == 3 && params.KH == 3) {
-        conv2d_implicit_gemm_f16<3, 3, use_mma><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
+        conv2d_implicit_gemm_f16<3, 3><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
     } else if (params.KW == 1 && params.KH == 1) {
-        conv2d_implicit_gemm_f16<1, 1, use_mma><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
+        conv2d_implicit_gemm_f16<1, 1><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
     } else {
-        conv2d_implicit_gemm_f16<0, 0, use_mma><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
+        conv2d_implicit_gemm_f16<0, 0><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
     }
 }
 
@@ -376,12 +335,8 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     conv_params   params = { IW, IH, OW, OH, KW, KH, ST_X, ST_Y, PD_X, PD_Y, DL_X, DL_Y, IC, OC, B, total };
 
     const auto & device = ggml_cuda_info().devices[ctx.device];
-    const bool   use_mma =
-        turing_mma_available(device.cc) || amd_wmma_available(device.cc) || amd_mfma_available(device.cc);
-    // MUSA can share the tiling without a native fragment implementation in mma.cuh.
-    const bool use_simt   = GGML_CUDA_CC_IS_MTHREADS(device.cc);
     const bool pointwise  = KW == 1 && KH == 1 && ST_X == 1 && ST_Y == 1 && PD_X == 0 && PD_Y == 0;
-    const bool use_blas   = pointwise && fast_fp16_hardware_available(device.cc);
+    const bool use_blas   = pointwise;
     // Short reductions on small maps do not amortize conversion and launch costs.
     const bool small_conv = IC * KW * KH < 64 && OW * OH < 512;
 
@@ -389,7 +344,7 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t padded_w = IW + 2 * int64_t(PD_X), padded_h = IH + 2 * int64_t(PD_Y);
     const bool    padded_fits = padded_w > 0 && padded_w <= limit && padded_h > 0 && padded_h <= limit &&
                              padded_w * padded_h <= limit && IC * B <= limit / (padded_w * padded_h);
-    if (kernel->type == GGML_TYPE_F16 && (use_mma || use_blas || use_simt) && (use_blas || !small_conv) &&
+    if (kernel->type == GGML_TYPE_F16 && (use_blas || !small_conv) &&
         ggml_nelements(input) <= limit && ggml_nelements(kernel) <= limit && total <= limit && padded_fits &&
         PD_X >= 0 && PD_Y >= 0 && ST_X > 0 && ST_Y > 0 && DL_X > 0 && DL_Y > 0 &&
         (OW - 1) * ST_X + (KW - 1) * DL_X < padded_w && (OH - 1) * ST_Y + (KH - 1) * DL_Y < padded_h &&
@@ -428,13 +383,7 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         float *                     result = split_k == 1 ? Y_D : partial.alloc(total * split_k);
         const dim3                  block(device.warp_size, 4);
         const dim3 grid(unsigned((OW * OH + 63) / 64), unsigned((OC + 63) / 64), unsigned(B * split_k));
-        if (use_mma) {
-            conv2d_launch_implicit_gemm<true>(x_half.get(), (const half *) K_D, result, padded_params, split_k, grid,
-                                              block, st);
-        } else {
-            conv2d_launch_implicit_gemm<false>(x_half.get(), (const half *) K_D, result, padded_params, split_k, grid,
-                                               block, st);
-        }
+        conv2d_launch_implicit_gemm(x_half.get(), (const half *) K_D, result, padded_params, split_k, grid, block, st);
         if (split_k > 1) {
             conv2d_reduce_split_k<<<(total + 255) / 256, 256, 0, st>>>(result, Y_D, int(total), int(OC * OW * OH),
                                                                        split_k);

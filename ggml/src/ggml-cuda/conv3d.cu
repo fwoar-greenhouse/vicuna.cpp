@@ -70,7 +70,7 @@ static __global__ void conv3d_pad_f16(const float * input,
                          0.0f);
 }
 
-template <int KW, int KH, int KD, bool use_mma>
+template <int KW, int KH, int KD>
 static __global__ void conv3d_implicit_gemm_f16(const half * __restrict__ input,
                                                 const half * __restrict__ weight,
                                                 float * __restrict__ output,
@@ -112,13 +112,10 @@ static __global__ void conv3d_implicit_gemm_f16(const half * __restrict__ input,
 #else
     using tile_c = tile<16, 16, float>;
 #endif
-    [[maybe_unused]] tile_c    c[2][2];
-    constexpr int              RM = 4, RN = BM * BN / (nthreads * RM);
-    [[maybe_unused]] const int simt_m = tid / (BN / RN) * RM, simt_n = tid % (BN / RN) * RN;
-    [[maybe_unused]] float     c_simt[RM][RN] = {};
-    const int                  tiles          = (k_total + BK - 1) / BK;
-    const int                  begin          = int(int64_t(tiles) * split / split_k) * BK;
-    const int                  end            = int(int64_t(tiles) * (split + 1) / split_k) * BK;
+    tile_c    c[2][2];
+    const int tiles = (k_total + BK - 1) / BK;
+    const int begin = int(int64_t(tiles) * split / split_k) * BK;
+    const int end   = int(int64_t(tiles) * (split + 1) / split_k) * BK;
     for (int k0 = begin; k0 < end; k0 += BK) {
         if (aligned_weights) {
 #pragma unroll
@@ -161,69 +158,34 @@ static __global__ void conv3d_implicit_gemm_f16(const half * __restrict__ input,
             b_s[k][load_lane] = __halves2half2(lo, hi);
         }
         __syncthreads();
-        if constexpr (use_mma) {
 #pragma unroll
-            for (int k = 0; k < BK; k += 16) {
-                tile_ab a[2], b[2];
+        for (int k = 0; k < BK; k += 16) {
+            tile_ab a[2], b[2];
 #pragma unroll
-                for (int i = 0; i < 2; ++i) {
-                    load_ldmatrix(a[i], &a_s[wm + 16 * i][k / 2], AS);
-                    load_ldmatrix_trans(b[i], &b_s[k][(wn + 16 * i) / 2], BS);
-                }
-#pragma unroll
-                for (int i = 0; i < 2; ++i) {
-#pragma unroll
-                    for (int j = 0; j < 2; ++j) {
-                        mma(c[i][j], a[i], b[j]);
-                    }
-                }
+            for (int i = 0; i < 2; ++i) {
+                load_ldmatrix(a[i], &a_s[wm + 16 * i][k / 2], AS);
+                load_ldmatrix_trans(b[i], &b_s[k][(wn + 16 * i) / 2], BS);
             }
-        } else {
-#pragma unroll 4
-            for (int k = 0; k < BK; ++k) {
-                float a[RM], b[RN];
 #pragma unroll
-                for (int i = 0; i < RM; ++i) {
-                    a[i] = __half2float(((const half *) a_s[simt_m + i])[k]);
-                }
+            for (int i = 0; i < 2; ++i) {
 #pragma unroll
-                for (int j = 0; j < RN; ++j) {
-                    b[j] = __half2float(((const half *) b_s[k])[simt_n + j]);
-                }
-#pragma unroll
-                for (int i = 0; i < RM; ++i) {
-#pragma unroll
-                    for (int j = 0; j < RN; ++j) {
-                        c_simt[i][j] += a[i] * b[j];
-                    }
+                for (int j = 0; j < 2; ++j) {
+                    mma(c[i][j], a[i], b[j]);
                 }
             }
         }
         __syncthreads();
     }
-    if constexpr (use_mma) {
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 2; ++i) {
 #pragma unroll
-            for (int j = 0; j < 2; ++j) {
+        for (int j = 0; j < 2; ++j) {
 #pragma unroll
-                for (int l = 0; l < c[i][j].ne; ++l) {
-                    const int co  = m0 + wm + 16 * i + c[i][j].get_i(l);
-                    const int pos = n0 + wn + 16 * j + c[i][j].get_j(l);
-                    if (co < oc && pos < ow * oh * od) {
-                        output[(int64_t(blockIdx.z) * oc + co) * ow * oh * od + pos] = c[i][j].x[l];
-                    }
-                }
-            }
-        }
-    } else {
-#pragma unroll
-        for (int i = 0; i < RM; ++i) {
-#pragma unroll
-            for (int j = 0; j < RN; ++j) {
-                const int co = m0 + simt_m + i, pos = n0 + simt_n + j;
+            for (int l = 0; l < c[i][j].ne; ++l) {
+                const int co  = m0 + wm + 16 * i + c[i][j].get_i(l);
+                const int pos = n0 + wn + 16 * j + c[i][j].get_j(l);
                 if (co < oc && pos < ow * oh * od) {
-                    output[(int64_t(blockIdx.z) * oc + co) * ow * oh * od + pos] = c_simt[i][j];
+                    output[(int64_t(blockIdx.z) * oc + co) * ow * oh * od + pos] = c[i][j].x[l];
                 }
             }
         }
@@ -249,7 +211,6 @@ static __global__ void conv3d_reduce_split_k(const float * __restrict__ partial,
     output[i] = sum;
 }
 
-template <bool use_mma>
 static void conv3d_launch_implicit_gemm(const half *          input,
                                         const half *          weight,
                                         float *               output,
@@ -262,16 +223,16 @@ static void conv3d_launch_implicit_gemm(const half *          input,
     const bool aligned_weights = uintptr_t(weight) % sizeof(int4) == 0 &&
                                  (params.IC * params.KW * params.KH * params.KD) % (sizeof(int4) / sizeof(half)) == 0;
     if (params.KW == 3 && params.KH == 3 && params.KD == 3) {
-        conv3d_implicit_gemm_f16<3, 3, 3, use_mma>
+        conv3d_implicit_gemm_f16<3, 3, 3>
             <<<grid, block, 0, stream>>>(input, weight, output, params, split_k, aligned_weights);
     } else if (params.KW == 1 && params.KH == 1 && params.KD == 3) {
-        conv3d_implicit_gemm_f16<1, 1, 3, use_mma>
+        conv3d_implicit_gemm_f16<1, 1, 3>
             <<<grid, block, 0, stream>>>(input, weight, output, params, split_k, aligned_weights);
     } else if (params.KW == 1 && params.KH == 1 && params.KD == 1) {
-        conv3d_implicit_gemm_f16<1, 1, 1, use_mma>
+        conv3d_implicit_gemm_f16<1, 1, 1>
             <<<grid, block, 0, stream>>>(input, weight, output, params, split_k, aligned_weights);
     } else {
-        conv3d_implicit_gemm_f16<0, 0, 0, use_mma>
+        conv3d_implicit_gemm_f16<0, 0, 0>
             <<<grid, block, 0, stream>>>(input, weight, output, params, split_k, aligned_weights);
     }
 }
@@ -298,11 +259,9 @@ void ggml_cuda_op_conv3d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float *             y      = (float *) dst->data;
     cudaStream_t        stream = ctx.stream();
     const auto &        device = ggml_cuda_info().devices[ctx.device];
-    const bool          use_mma =
-        turing_mma_available(device.cc) || amd_wmma_available(device.cc) || amd_mfma_available(device.cc);
     const bool pointwise =
         KW == 1 && KH == 1 && KD == 1 && p[0] == 1 && p[1] == 1 && p[2] == 1 && p[3] == 0 && p[4] == 0 && p[5] == 0;
-    const bool    use_blas = pointwise && fast_fp16_hardware_available(device.cc);
+    const bool    use_blas = pointwise;
     const int64_t limit    = INT_MAX - 256;
     const int64_t pw = IW + 2 * int64_t(p[3]), ph = IH + 2 * int64_t(p[4]), pd = ID + 2 * int64_t(p[5]);
     const bool    padded_fits = pw > 0 && pw <= limit && ph > 0 && ph <= limit && pd > 0 && pd <= limit &&
@@ -342,11 +301,7 @@ void ggml_cuda_op_conv3d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         float *                     result = split_k == 1 ? y : partial.alloc(total * split_k);
         const dim3                  block(device.warp_size, 4);
         const dim3 grid(unsigned((positions + 63) / 64), unsigned((OC + 63) / 64), unsigned(B * split_k));
-        if (use_mma) {
-            conv3d_launch_implicit_gemm<true>(x_half.get(), w, result, padded_params, split_k, grid, block, stream);
-        } else {
-            conv3d_launch_implicit_gemm<false>(x_half.get(), w, result, padded_params, split_k, grid, block, stream);
-        }
+        conv3d_launch_implicit_gemm(x_half.get(), w, result, padded_params, split_k, grid, block, stream);
         if (split_k > 1) {
             conv3d_reduce_split_k<<<unsigned((total + 255) / 256), 256, 0, stream>>>(result, y, int(total),
                                                                                      int(OC * positions), split_k);

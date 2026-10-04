@@ -764,15 +764,6 @@ namespace ggml_cuda_mma {
 #endif // AMD_MFMA_AVAILABLE
     }
 
-    template <ggml_type type>
-    static __device__ __forceinline__ void mma_block_scaled_fp4(tile<16, 8, float> &     D,
-                                                                const tile<16, 8, int> & A,
-                                                                const tile<8, 8, int> &  B,
-                                                                uint32_t                 a_scale,
-                                                                uint32_t                 b_scale) {
-        GGML_UNUSED_VARS(D, A, B, a_scale, b_scale);
-    }
-
     static __device__ __forceinline__ void mma(
             tile<16, 8, float> & D, const tile<16, 8, half2> & A, const tile<8, 8, half2> & B) {
         GGML_UNUSED_VARS(D, A, B);

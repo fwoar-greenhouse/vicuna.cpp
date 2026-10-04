@@ -9,22 +9,6 @@ using namespace ggml_cuda_mma;
 #define MMF_ROWS_PER_BLOCK 32
 #define MMF_ROWS_PER_BLOCK_CDNA 64
 
-static __forceinline__ int64_t mmf_get_max_block_size(int cc) {
-    if (GGML_CUDA_CC_IS_CDNA(cc)) {
-        return 512;
-    } else {
-        return 256;
-    }
-}
-
-static __forceinline__ int mmf_get_padding(int cc) {
-    if (GGML_CUDA_CC_IS_CDNA(cc)) {
-        return 2;
-    } else {
-        return 4;
-    }
-}
-
 static constexpr __device__ int mmf_get_padding() {
 #if defined(AMD_MFMA_AVAILABLE)
     return 2;
@@ -622,9 +606,7 @@ void mul_mat_f_cuda(
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         cudaStream_t stream, const mmf_ids_data * ids_data) {
     typedef tile<16, 8, T>     tile_A_16;
-    typedef tile<32, 8, T>     tile_A_32;
     typedef tile<16, 8, T>     tile_B_16;
-    typedef tile< 8, 8, T>     tile_B_8;
 
     GGML_ASSERT(ncols_x      % 2 == 0);
     GGML_ASSERT(stride_row   % 2 == 0);
@@ -635,12 +617,14 @@ void mul_mat_f_cuda(
     const int64_t sample_ratio  = nsamples_dst  / nsamples_x;
 
     const int device    = ggml_cuda_get_device();
-    const int cc        = ggml_cuda_info().devices[device].cc;
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    // Must match mmf_get_padding() in device code.
+    constexpr int padding = 2;
 
     int64_t nwarps_best     = 1;
     int64_t niter_best      = (ncols_x + warp_size*2 - 1) / (warp_size*2);
-    int64_t max_block_size  = mmf_get_max_block_size(cc);
+    int64_t max_block_size  = 512;
     for (int64_t nwarps = 2; nwarps <= max_block_size/warp_size; nwarps++) {
         const int64_t niter = (ncols_x + nwarps*warp_size*2 - 1) / (nwarps*warp_size*2);
         if (niter < niter_best) {
@@ -649,9 +633,8 @@ void mul_mat_f_cuda(
         }
     }
 
-    const int nbytes_shared_iter = nwarps_best * (volta_mma_available(cc) ? tile_A_32::I : tile_A_16::I) * (warp_size + mmf_get_padding(cc)) * 4;
-    const int nbytes_cols_per_block_pad = (amd_wmma_available(cc) || amd_mfma_available(cc)) ? tile_B_16::I : tile_B_8::I;
-    const int nbytes_shared_combine = GGML_PAD(cols_per_block, nbytes_cols_per_block_pad) * (nwarps_best*rows_per_block + mmf_get_padding(cc)) * 4;
+    const int nbytes_shared_iter = nwarps_best * tile_A_16::I * (warp_size + padding) * 4;
+    const int nbytes_shared_combine = GGML_PAD(cols_per_block, tile_B_16::I) * (nwarps_best*rows_per_block + padding) * 4;
     const int nbytes_shared = std::max(nbytes_shared_iter, nbytes_shared_combine);
     const int nbytes_slotmap = ids ? GGML_PAD(cols_per_block, 16) * sizeof(int) : 0;
     const int nbytes_shared_total = nbytes_shared + nbytes_slotmap;
@@ -827,34 +810,6 @@ static void mul_mat_f_switch_cols_per_block(
     }
 }
 
-template <typename T>
-static void mul_mat_f_switch_rows_per_block(
-        const int rows_per_block, const T * x, const float * y, const int32_t * ids, float * dst,
-        const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
-        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
-        const int64_t stride_col_id, const int stride_row_id,
-        const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
-        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
-        const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
-        cudaStream_t stream, const mmf_ids_data * ids_data) {
-    switch (rows_per_block) {
-        case MMF_ROWS_PER_BLOCK: {
-            mul_mat_f_switch_cols_per_block<T, MMF_ROWS_PER_BLOCK>(
-                x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case MMF_ROWS_PER_BLOCK_CDNA: {
-            mul_mat_f_switch_cols_per_block<T, MMF_ROWS_PER_BLOCK_CDNA>(
-                x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        default:
-            GGML_ABORT("unsupported rows_per_block: %i", rows_per_block);
-    }
-}
-
 #define DECL_MMF_CASE_HELPER(T, nrows_dst, ncols_dst) \
     template void mul_mat_f_cuda<T, nrows_dst, ncols_dst>( \
         const T * x, const float * y, const int32_t * ids, float * dst, \
@@ -866,17 +821,11 @@ static void mul_mat_f_switch_rows_per_block(
         cudaStream_t stream, const mmf_ids_data * ids_data);
 
 #define DECL_MMF_CASE_EXTERN(ncols_dst) \
-    extern DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK, ncols_dst) \
-    extern DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK, ncols_dst) \
-    extern DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK, ncols_dst) \
     extern DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
     extern DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
     extern DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst)
 
 #define DECL_MMF_CASE(ncols_dst) \
-    DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK, ncols_dst) \
-    DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK, ncols_dst) \
-    DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK, ncols_dst) \
     DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
     DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
     DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst)

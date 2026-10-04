@@ -6,10 +6,6 @@
 #include <cstdint>
 #include <type_traits>
 
-// only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
-// has little exposed latency left to hide and the extra requests cost more than they save.
-// For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
-
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -70,12 +66,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
-    MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
-    MMVQ_PARAMETERS_RDNA2,
-    MMVQ_PARAMETERS_RDNA3_0,
-    MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -86,94 +77,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #endif
 }
 
-static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
-    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-        return MMVQ_PARAMETERS_RDNA4;
-    }
-    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
-        return MMVQ_PARAMETERS_RDNA3_0;
-    }
-    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) {
-        return MMVQ_PARAMETERS_RDNA2;
-    }
-    if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
-        return MMVQ_PARAMETERS_GCN;
-    }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
-        return MMVQ_PARAMETERS_TURING;
-    }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
-        return MMVQ_PARAMETERS_GB10;
-    }
-    return MMVQ_PARAMETERS_GENERIC;
-}
-
-// Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
+// Maximum batch size for which MMVQ should be used for MUL_MAT_ID.
 // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
 // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
-
-static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_IQ1_S:   return 6;
-        case GGML_TYPE_IQ1_M:   return 6;
-        case GGML_TYPE_IQ2_S:   return 4;
-        case GGML_TYPE_IQ2_XS:  return 5;
-        case GGML_TYPE_IQ2_XXS: return 5;
-        case GGML_TYPE_IQ3_S:   return 4;
-        case GGML_TYPE_IQ3_XXS: return 4;
-        case GGML_TYPE_IQ4_NL:  return 6;
-        case GGML_TYPE_IQ4_XS:  return 5;
-        case GGML_TYPE_MXFP4:   return 4;
-        case GGML_TYPE_NVFP4:   return 4;
-        case GGML_TYPE_Q2_K:    return 4;
-        case GGML_TYPE_Q3_K:    return 4;
-        case GGML_TYPE_Q4_0:    return 6;
-        case GGML_TYPE_Q4_1:    return 6;
-        case GGML_TYPE_Q4_K:    return 5;
-        case GGML_TYPE_Q5_0:    return 6;
-        case GGML_TYPE_Q5_1:    return 6;
-        case GGML_TYPE_Q5_K:    return 5;
-        case GGML_TYPE_Q6_K:    return 4;
-        case GGML_TYPE_Q8_0:    return 4;
-        default:                return MMVQ_MAX_BATCH_SIZE;
-    }
-}
-
-static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_IQ2_S:   return 7;
-        case GGML_TYPE_IQ3_S:   return 6;
-        case GGML_TYPE_IQ3_XXS: return 7;
-        case GGML_TYPE_MXFP4:   return 7;
-        case GGML_TYPE_NVFP4:   return 8;
-        case GGML_TYPE_Q2_K:    return 7;
-        case GGML_TYPE_Q3_K:    return 5;
-        default:                return MMVQ_MAX_BATCH_SIZE;
-    }
-}
-
-static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_gcn(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_IQ1_S:   return 5;
-        case GGML_TYPE_IQ1_M:   return 5;
-        case GGML_TYPE_IQ2_S:   return 4;
-        case GGML_TYPE_IQ2_XS:  return 4;
-        case GGML_TYPE_IQ2_XXS: return 4;
-        case GGML_TYPE_IQ3_S:   return 4;
-        case GGML_TYPE_IQ3_XXS: return 4;
-        case GGML_TYPE_IQ4_NL:  return 6;
-        case GGML_TYPE_IQ4_XS:  return 4;
-        case GGML_TYPE_Q2_K:    return 4;
-        case GGML_TYPE_Q3_K:    return 4;
-        case GGML_TYPE_Q4_0:    return 5;
-        case GGML_TYPE_Q4_1:    return 5;
-        case GGML_TYPE_Q4_K:    return 4;
-        case GGML_TYPE_Q5_K:    return 4;
-        case GGML_TYPE_Q6_K:    return 4;
-        case GGML_TYPE_Q8_0:    return 4;
-        default:                return MMVQ_MAX_BATCH_SIZE;
-    }
-}
 
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_cdna(ggml_type type) {
     switch (type) {
@@ -186,210 +92,47 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_cdna(ggml_type 
     }
 }
 
-static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna1_rdna2(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_IQ2_S:   return 4;
-        case GGML_TYPE_IQ2_XS:  return 4;
-        case GGML_TYPE_IQ2_XXS: return 4;
-        case GGML_TYPE_IQ3_S:   return 4;
-        case GGML_TYPE_IQ3_XXS: return 4;
-        case GGML_TYPE_Q2_K:    return 7;
-        case GGML_TYPE_Q3_K:    return 4;
-        case GGML_TYPE_Q4_K:    return 5;
-        case GGML_TYPE_Q5_K:    return 6;
-        case GGML_TYPE_Q6_K:    return 5;
-        default:                return MMVQ_MAX_BATCH_SIZE;
-    }
-}
-
-static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_IQ1_S:   return 6;
-        case GGML_TYPE_IQ1_M:   return 6;
-        case GGML_TYPE_IQ2_S:   return 4;
-        case GGML_TYPE_IQ2_XS:  return 4;
-        case GGML_TYPE_IQ2_XXS: return 4;
-        case GGML_TYPE_IQ3_S:   return 4;
-        case GGML_TYPE_IQ3_XXS: return 4;
-        case GGML_TYPE_IQ4_NL:  return 6;
-        case GGML_TYPE_IQ4_XS:  return 6;
-        case GGML_TYPE_Q4_K:    return 4;
-        case GGML_TYPE_Q5_K:    return 4;
-        case GGML_TYPE_Q6_K:    return 4;
-        default:                return MMVQ_MAX_BATCH_SIZE;
-    }
-}
-
-static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_IQ1_S:   return 7;
-        case GGML_TYPE_IQ1_M:   return 7;
-        case GGML_TYPE_IQ2_S:   return 4;
-        case GGML_TYPE_IQ2_XS:  return 4;
-        case GGML_TYPE_IQ2_XXS: return 4;
-        case GGML_TYPE_IQ3_S:   return 4;
-        case GGML_TYPE_IQ3_XXS: return 4;
-        case GGML_TYPE_IQ4_NL:  return 7;
-        case GGML_TYPE_IQ4_XS:  return 5;
-        case GGML_TYPE_MXFP4:   return 5;
-        case GGML_TYPE_NVFP4:   return 5;
-        case GGML_TYPE_Q3_K:    return 4;
-        case GGML_TYPE_Q4_0:    return 7;
-        case GGML_TYPE_Q4_1:    return 7;
-        case GGML_TYPE_Q4_K:    return 4;
-        case GGML_TYPE_Q5_0:    return 7;
-        case GGML_TYPE_Q5_1:    return 7;
-        case GGML_TYPE_Q5_K:    return 5;
-        case GGML_TYPE_Q6_K:    return 5;
-        case GGML_TYPE_Q8_0:    return 7;
-        default:                return MMVQ_MAX_BATCH_SIZE;
-    }
-}
-
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
-    // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
-    if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-        if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-            return MMVQ_MAX_BATCH_SIZE;
-        }
-        if (cc >= GGML_CUDA_CC_TURING) {
-            return get_mmvq_mmid_max_batch_turing_plus(type);
-        }
-        return get_mmvq_mmid_max_batch_pascal_older(type);
-    }
-
-    // AMD
-    if (GGML_CUDA_CC_IS_AMD(cc)) {
-        if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-            return get_mmvq_mmid_max_batch_rdna4(type);
-        }
-        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
-            return get_mmvq_mmid_max_batch_rdna3(type);
-        }
-        if (GGML_CUDA_CC_IS_RDNA1(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) {
-            return get_mmvq_mmid_max_batch_rdna1_rdna2(type);
-        }
-        if (GGML_CUDA_CC_IS_CDNA(cc)) {
-            return get_mmvq_mmid_max_batch_cdna(type);
-        }
-        if (GGML_CUDA_CC_IS_GCN(cc)) {
-            return get_mmvq_mmid_max_batch_gcn(type);
-        }
-    }
-    return MMVQ_MAX_BATCH_SIZE;
+    GGML_UNUSED(cc);
+    return get_mmvq_mmid_max_batch_cdna(type);
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+    GGML_UNUSED(cc);
+
     if (!ggml_is_quantized(type)) {
         return false;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
-        switch (type) { // tuned on RTX 4090
-            case GGML_TYPE_Q2_K:
-                return ne11 <= 4;
-            case GGML_TYPE_Q3_K:
-                return ne11 <= 6;
-            default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
-        }
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+            return ne11 <= 7;
+        case GGML_TYPE_Q5_1:
+            return ne11 <= 7;
+        case GGML_TYPE_Q8_0:
+            return ne11 <= 6;
+        case GGML_TYPE_Q2_K:
+            return ne11 <= 4;
+        case GGML_TYPE_Q3_K:
+            return ne11 <= 3;
+        case GGML_TYPE_Q4_K:
+            return ne11 <= 2;
+        case GGML_TYPE_Q5_K:
+            return ne11 <= 3;
+        case GGML_TYPE_Q6_K:
+            return ne11 <= 4;
+        case GGML_TYPE_IQ1_S:
+            return ne11 <= 5;
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+            return ne11 <= 6;
+        default:
+            return ne11 <= MMVQ_MAX_BATCH_SIZE;
     }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_BLACKWELL) {
-        switch (type) { // tuned on RTX 5090
-            case GGML_TYPE_Q2_K:
-            case GGML_TYPE_Q3_K:
-            case GGML_TYPE_Q4_K:
-                return ne11 <= 5;
-            case GGML_TYPE_Q5_K:
-                return ne11 <= 6;
-            case GGML_TYPE_Q6_K:
-                return ne11 <= 7;
-            default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
-        }
-    }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK) {
-        switch (type) { // tuned on DGX Spark GB10
-            case GGML_TYPE_Q2_K:
-                return ne11 <= 6;
-            default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
-        }
-    }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ORIN) {
-        switch (type) { // tuned for Jetson Orin
-            case GGML_TYPE_Q2_K:
-            case GGML_TYPE_Q3_K:
-            case GGML_TYPE_Q4_K:
-            case GGML_TYPE_Q5_K:
-            case GGML_TYPE_Q6_K:
-                return ne11 <= 1;
-            default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
-        }
-    }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA) {
-        switch (type) {
-            case GGML_TYPE_Q2_K:
-                return ne11 <= 4;
-            case GGML_TYPE_Q3_K:
-                return ne11 <= 6;
-            case GGML_TYPE_Q4_K:
-                return ne11 <= 5;
-            case GGML_TYPE_Q5_K:
-                return ne11 <= 6;
-            case GGML_TYPE_Q6_K:
-                return ne11 <= 7;
-            default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
-        }
-    }
-    if (GGML_CUDA_CC_IS_CDNA(cc)) {
-        if (GGML_CUDA_CC_IS_CDNA1(cc)) {
-            switch (type) {
-                case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q4_1:
-                    return ne11 <= 7;
-                case GGML_TYPE_Q5_1:
-                    return ne11 <= 7;
-                case GGML_TYPE_Q8_0:
-                    return ne11 <= 6;
-                case GGML_TYPE_Q2_K:
-                    return ne11 <= 4;
-                case GGML_TYPE_Q3_K:
-                    return ne11 <= 3;
-                case GGML_TYPE_Q4_K:
-                    return ne11 <= 2;
-                case GGML_TYPE_Q5_K:
-                    return ne11 <= 3;
-                case GGML_TYPE_Q6_K:
-                    return ne11 <= 4;
-                case GGML_TYPE_IQ1_S:
-                    return ne11 <= 5;
-                case GGML_TYPE_IQ2_XXS:
-                case GGML_TYPE_IQ3_S:
-                case GGML_TYPE_IQ4_XS:
-                    return ne11 <= 6;
-                default:
-                    return ne11 <= MMVQ_MAX_BATCH_SIZE;
-            }
-        }
-        switch (type) { // tuned for CDNA2
-            case GGML_TYPE_Q2_K:
-                return ne11 <= 5;
-            case GGML_TYPE_Q3_K:
-            case GGML_TYPE_Q4_K:
-            case GGML_TYPE_Q5_K:
-                return ne11 <= 3;
-            case GGML_TYPE_Q6_K:
-                return ne11 <= 5;
-            default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
-        }
-    }
-    return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
@@ -402,7 +145,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+static constexpr __host__ __device__ int calc_nwarps(int ncols_dst, mmvq_parameter_table_id table_id) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -433,104 +176,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     }
-    if (table_id == MMVQ_PARAMETERS_RDNA4) {
-        // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
-        // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
-        // pressure and lookup table contention at higher thread counts.
-        if (ncols_dst == 1) {
-            switch (type) {
-                case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q4_1:
-                case GGML_TYPE_Q5_0:
-                case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
-                case GGML_TYPE_Q2_K:
-                case GGML_TYPE_Q4_K:
-                case GGML_TYPE_Q5_K:
-                case GGML_TYPE_Q6_K:
-                case GGML_TYPE_IQ4_NL:
-                case GGML_TYPE_IQ4_XS:
-                    return 8;
-                default:
-                    return 1;
-            }
-        }
-        return 1;
-    }
-    if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
-        // RDNA3 (W7900): stricter whitelist than RDNA4.
-        // Q2_K / Q5_K / IQ4_XS regress in full quant sweeps.
-        if (ncols_dst == 1) {
-            switch (type) {
-                case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q4_1:
-                case GGML_TYPE_Q5_0:
-                case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
-                    return 8;
-                case GGML_TYPE_Q6_K:
-                    return 2;
-                case GGML_TYPE_IQ4_NL:
-                    return 8;
-                default:
-                    return 1;
-            }
-        }
-        return 1;
-    }
-    if (table_id == MMVQ_PARAMETERS_TURING) {
-        if (ncols_dst == 1) {
-            switch (type) {
-                case GGML_TYPE_Q2_K:
-                case GGML_TYPE_Q3_K:
-                case GGML_TYPE_Q4_K:
-                case GGML_TYPE_Q5_K:
-                case GGML_TYPE_Q6_K:
-                    return 2;
-                default:
-                    return 4;
-            }
-        }
-        switch (ncols_dst) {
-            case 2:
-            case 3:
-            case 4:
-                return 4;
-            case 5:
-            case 6:
-            case 7:
-            case 8:
-                return 2;
-            default:
-                return 1;
-        }
-    }
-    if (table_id == MMVQ_PARAMETERS_GB10) {
-        const int generic = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
-        // Only worth the wider block when it actually retires the K loop in half the trips (Observation)
-        if (ncols_dst == 1 && !small_k && halve_iters) {
-            switch (type) {
-                case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q4_1:
-                case GGML_TYPE_Q5_0:
-                case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
-                case GGML_TYPE_Q4_K:
-                case GGML_TYPE_Q5_K:
-                case GGML_TYPE_Q6_K:
-                case GGML_TYPE_IQ4_NL:
-                    return 2 * generic;
-                default:
-                    break;
-            }
-        }
-        return generic;
-    }
     return 1;
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -549,8 +199,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
+__launch_bounds__(calc_nwarps(ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -567,7 +217,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+    constexpr int nwarps = calc_nwarps(ncols_dst, table_id);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -932,8 +582,8 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
+    const int nwarps = calc_nwarps(ncols_dst, table_id);
     const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
@@ -941,7 +591,7 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -956,7 +606,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -967,7 +617,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1024,9 +674,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
 
     const int device = ggml_cuda_get_device();
-    const int                     cc        = ggml_cuda_info().devices[device].cc;
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
-    const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
+    constexpr mmvq_parameter_table_id table_id = MMVQ_PARAMETERS_GCN;
 
     const bool has_ids = ids != nullptr;
 
@@ -1040,60 +689,19 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
-        const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+        const int  nwarps = calc_nwarps(c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
-        constexpr std::array<ggml_type, 2> iq_slow_turing = {
-            GGML_TYPE_IQ3_XXS,
-            GGML_TYPE_IQ3_S,
-        };
-        constexpr std::array<ggml_type, 8> iq_slow_other = {
+        constexpr std::array<ggml_type, 8> iq_slow = {
             GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
             GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
         };
-        constexpr std::array<ggml_type, 3> slow_pascal = {
-            GGML_TYPE_IQ3_S,
-            GGML_TYPE_Q2_K,
-            GGML_TYPE_Q3_K,
-        };
 
-        const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
-        const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
-
-        if (is_nvidia_turing_plus) {
-            if (ncols_dst == 1 &&
-                    std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
-                use = false;
-            }
-        } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
-                (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
+        if (ncols_dst == 1 && std::find(iq_slow.begin(), iq_slow.end(), type) != iq_slow.end()) {
             use = false;
         }
 
         return use;
-    };
-
-    // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
-    const auto should_halve_iters = [&] {
-        if (table_id != MMVQ_PARAMETERS_GB10) {
-            return false;
-        }
-
-        // Expert rows are gathered per token, so a wider block adds reduction work without reuse.
-        if (has_ids) {
-            return false;
-        }
-
-        const int blocks_per_iter = calc_nwarps(type, 1, table_id) * blocks_per_iter_1warp;
-        const int iters           = (blocks_per_row_x + blocks_per_iter - 1) /  blocks_per_iter;
-        const int iters_wide      = (blocks_per_row_x + blocks_per_iter * 2 - 1) / (blocks_per_iter * 2);
-
-        // An odd trip count leaves half the wider block idle for its last iteration, that tail is
-        // only affordable once the loop is long enough to dilute it to an eighth of the work (observation).
-        const int idle = iters_wide * 2 - iters;
-
-        return idle * 8 <= iters_wide * 2;
     };
 
     if (has_ids && ncols_dst > 1) {
@@ -1112,18 +720,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
             static constexpr int c_ncols_dst = 1;
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
+            const auto launch = [&](auto small_k_tag) {
                 constexpr bool c_small_k = decltype(small_k_tag)::value;
-                // Types the table does not promote would compile a second, identical kernel.
-                constexpr bool c_promoted =
-                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
-                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
-
-                constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
                 const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
+                                                                              nsamples_dst, warp_size, table_id, c_small_k);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
@@ -1131,11 +733,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
             };
 
             if (should_use_small_k(c_ncols_dst)) {
-                launch(std::true_type{},  std::false_type{});
-            } else if (should_halve_iters()) {
-                launch(std::false_type{}, std::true_type{});
+                launch(std::true_type{});
             } else {
-                launch(std::false_type{}, std::false_type{});
+                launch(std::false_type{});
             }
         } break;
         case 2: {

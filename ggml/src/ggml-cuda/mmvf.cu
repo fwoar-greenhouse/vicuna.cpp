@@ -405,10 +405,7 @@ void launch_mul_mat_vec_f_cuda(
 
     int64_t block_size_best = warp_size;
     int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
-    int64_t max_block_size  = 256;
-    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
-        max_block_size = 128;
-    }
+    int64_t max_block_size  = 128;
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
         const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
         if (niter < niter_best) {
@@ -619,8 +616,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
     GGML_ASSERT(        nb0        == ts_dst);
 
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
+    const enum ggml_prec prec = ggml_prec(dst->op_params[0]);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
@@ -711,8 +707,7 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t row_diff = row_high - row_low;
 
     const int id = ggml_cuda_get_device();
-    const int cc = ggml_cuda_info().devices[id].cc;
-    const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
+    const enum ggml_prec prec = ggml_prec(dst->op_params[0]);
 
     // ggml_cuda_op provides single, contiguous matrices
     const int64_t stride_row         = ne00;
@@ -758,6 +753,8 @@ void ggml_cuda_op_mul_mat_vec_f(
 }
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+    GGML_UNUSED(cc);
+
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
@@ -776,67 +773,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
 
     switch (type) {
         case GGML_TYPE_F32:
-            if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                if (ampere_mma_available(cc)) {
-                    return ne11 <= 3;
-                }
-                if (cc >= GGML_CUDA_CC_TURING) {
-                    return ne11 <= 4;
-                }
-                return ne11 <= 3;
-            } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (fp32_mma_hardware_available(cc)) {
-                    return ne11 <= 3;
-                }
-                return ne11 <= 8;
-            }
-            return ne11 <= 8;
+            return ne11 <= 3;
         case GGML_TYPE_F16:
-            if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
-                if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
-                }
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    return src0_small && ne11 <= 4;
-                }
-                if (fp16_mma_hardware_available(cc)) {
-                    return src0_small && ne11 <= 3;
-                }
-                return ne11 <= 8;
-            } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (fp16_mma_hardware_available(cc)) {
-                    if (GGML_CUDA_CC_IS_RDNA3(cc)) {
-                        return ne11 <= 3;
-                    }
-                    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-                        return ne11 <= 5;
-                    }
-                    return ne11 <= 2;
-                }
-                return ne11 <= 8;
-            }
-            return ne11 <= 8;
+            return ne11 <= 2;
         case GGML_TYPE_BF16:
-            if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
-                if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
-                }
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    return src0_small && ne11 <= 4;
-                }
-                if (bf16_mma_hardware_available(cc)) {
-                    return src0_small && ne11 <= 3;
-                }
-                return ne11 <= 8;
-            } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (bf16_mma_hardware_available(cc)) {
-                    return ne11 <= 3;
-                }
-                return ne11 <= 8;
-            }
-            return ne11 <= 8;
+            return ne11 <= 3;
         default:
             return false;
     }
