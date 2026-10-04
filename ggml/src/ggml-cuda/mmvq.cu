@@ -244,13 +244,15 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    // For one column Q5_K use 128 bit loads. With more columns the coarser K split costs more than it gains.
+    constexpr bool use_x4 = ncols_dst == 1 && type == GGML_TYPE_Q5_K;
+    constexpr int vdr = use_x4 ? VDR_Q5_K_Q8_1_MMVQ_X4 : get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(ncols_dst, table_id, wide);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type, wide);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = use_x4 ? vec_dot_q5_K_q8_1_x4 : get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
