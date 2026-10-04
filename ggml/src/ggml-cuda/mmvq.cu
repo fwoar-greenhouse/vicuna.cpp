@@ -114,41 +114,46 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return get_mmvq_mmid_max_batch_cdna(type);
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+// Largest ncols for which MMVQ beats MMQ on MI100, for matrices with >= 4096 rows and with 1024-4095 rows.
+// MMQ has fewer row tiles to spread over the CUs for smaller matrices, so MMVQ wins up to more columns.
+static int mmvq_max_ncols(const ggml_type type, const bool large) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:    return large ? 1 : 2;
+        case GGML_TYPE_Q2_0:    return large ? 5 : 6;
+        case GGML_TYPE_Q4_0:    return large ? 6 : 7;
+        case GGML_TYPE_Q4_1:    return large ? 6 : 7;
+        case GGML_TYPE_Q5_0:    return large ? 7 : 8;
+        case GGML_TYPE_Q5_1:    return large ? 7 : 8;
+        case GGML_TYPE_Q8_0:    return large ? 5 : 7;
+        case GGML_TYPE_Q2_K:    return large ? 2 : 3;
+        case GGML_TYPE_Q3_K:    return large ? 1 : 2;
+        case GGML_TYPE_Q4_K:    return large ? 3 : 4;
+        case GGML_TYPE_Q5_K:    return large ? 3 : 4;
+        case GGML_TYPE_Q6_K:    return 5;
+        case GGML_TYPE_IQ1_S:   return large ? 6 : 7;
+        case GGML_TYPE_IQ2_XXS: return large ? 4 : 5;
+        case GGML_TYPE_IQ2_XS:  return large ? 3 : 4;
+        case GGML_TYPE_IQ2_S:   return large ? 4 : 5;
+        case GGML_TYPE_IQ3_XXS: return large ? 4 : 5;
+        case GGML_TYPE_IQ3_S:   return large ? 4 : 5;
+        case GGML_TYPE_IQ4_NL:  return large ? 5 : 6;
+        case GGML_TYPE_IQ4_XS:  return large ? 7 : 8;
+        case GGML_TYPE_MXFP4:   return large ? 7 : 8;
+        case GGML_TYPE_NVFP4:   return large ? 2 : 3;
+        default:                return MMVQ_MAX_BATCH_SIZE; // MMQ not supported, the fallback is cuBLAS
+    }
+}
+
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_t ne11) {
     GGML_UNUSED(cc);
 
     if (!ggml_is_quantized(type)) {
         return false;
     }
-    // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
-    // Only list quant-types MMQ supports, others would fall back to cuBLAS.
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-            return ne11 <= 7;
-        case GGML_TYPE_Q5_1:
-            return ne11 <= 7;
-        case GGML_TYPE_Q8_0:
-            return ne11 <= 6;
-        case GGML_TYPE_Q2_K:
-            return ne11 <= 4;
-        case GGML_TYPE_Q3_K:
-            return ne11 <= 3;
-        case GGML_TYPE_Q4_K:
-            return ne11 <= 2;
-        case GGML_TYPE_Q5_K:
-            return ne11 <= 3;
-        case GGML_TYPE_Q6_K:
-            return ne11 <= 4;
-        case GGML_TYPE_IQ1_S:
-            return ne11 <= 5;
-        case GGML_TYPE_IQ2_XXS:
-        case GGML_TYPE_IQ3_S:
-        case GGML_TYPE_IQ4_XS:
-            return ne11 <= 6;
-        default:
-            return ne11 <= MMVQ_MAX_BATCH_SIZE;
+    if (ne01 < 1024) {
+        return ne11 <= MMVQ_MAX_BATCH_SIZE;
     }
+    return ne11 <= mmvq_max_ncols(type, ne01 >= 4096);
 }
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
