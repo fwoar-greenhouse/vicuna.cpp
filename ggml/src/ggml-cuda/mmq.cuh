@@ -178,7 +178,7 @@ struct ggml_cuda_mmq_config {
         type(type), nthreads(nthreads), occupancy(occupancy), I(I), J(J), sram_layout(sram_layout), K_vram(K_vram), stream_k(stream_k), fallback(fallback) {}
 
     constexpr __device__ int rows_per_warp() const {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
         return 16;
 #else
         return J >= 48 && J % 16 == 0 ? 32 : 16;
@@ -194,7 +194,7 @@ struct ggml_cuda_mmq_config {
     }
 
     constexpr __device__ bool use_mma_data_layout() const {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
         return true;
 #else
         return false;
@@ -263,35 +263,11 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 }
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8) {
-#ifdef GGML_USE_HIP
-#ifdef GCN
-    return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
-#elif defined(CDNA)
+#if   defined(CDNA)
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
-#elif defined(RDNA4)
-    return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
-#elif defined(RDNA3_5)
-    return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
-#elif defined(RDNA3)
-    return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
 #else
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
 #endif // CDNA
-#else
-#ifdef BLACKWELL_MMA_AVAILABLE
-    // only src1 at Q4 uses the native FP4 config, higher precisions keep src1 at Q8_1
-    if (prec_src1 != GGML_PREC_Q4 && (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4)) {
-        return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
-    }
-    return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
-#elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
-#elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
-    return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
-#else
-    return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
-#endif // BLACKWELL_MMA_AVAILABLE
-#endif // GGML_USE_HIP
     GGML_UNUSED_VARS(type, J, fallback, prec_src1);
 }
 
@@ -481,7 +457,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
             const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
             const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
     typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
 #else
     typedef tile<16,  8, int> tile_C;
@@ -687,30 +663,6 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
 
 // ---------------------------------------------------------------------------------------------
 
-#ifdef BLACKWELL_MMA_AVAILABLE
-    switch (type) {
-        case GGML_TYPE_MXFP4:
-            if (prec_src1 == GGML_PREC_Q4) {
-                return ggml_cuda_mmq_util_funcs(
-                    -1,
-                    ggml_cuda_mmq_load_tiles_mxfp4_fp4<type, J, fallback>,
-                    ggml_cuda_mmq_vec_dot_fp4_fp4_mma<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_mma<type, J, fallback>);
-            }
-            break;
-        case GGML_TYPE_NVFP4:
-            if (prec_src1 == GGML_PREC_Q4) {
-                return ggml_cuda_mmq_util_funcs(
-                    -1,
-                    ggml_cuda_mmq_load_tiles_nvfp4_nvfp4<type, J, fallback>,
-                    ggml_cuda_mmq_vec_dot_fp4_fp4_mma<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_mma<type, J, fallback>);
-            }
-            break;
-        default:
-            break;
-    }
-#endif // BLACKWELL_MMA_AVAILABLE
 
 // ---------------------------------------------------------------------------------------------
 
@@ -897,14 +849,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     int * tile_y = data_mul_mat_q + J;
     int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
-#if defined(BLACKWELL_MMA_AVAILABLE)
-    // FP4 tile stores 8 blocks. src1 above Q4 uses the generic
-    // Q8_1 tile layout instead of the packed FP4 tile.
-    constexpr int ne_block = ((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) && prec_src1 == GGML_PREC_Q4) ?
-        QK_FP4_MMQ : QK8_1_MMQ;
-#else
     constexpr int ne_block = QK8_1_MMQ;
-#endif  // defined(BLACKWELL_MMA_AVAILABLE)
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1);
     constexpr int blocks_per_iter = ITER_K / qk;

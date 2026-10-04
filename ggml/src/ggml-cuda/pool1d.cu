@@ -29,11 +29,7 @@ static __global__ void pool1d_nchw_kernel(
 
     int count = 0;
     for (int i = b; i < e; i++) {
-#if __CUDA_ARCH__ >= 350
         float cur = __ldg(i_ptr + i);
-#else
-        float cur = i_ptr[i];
-#endif
         switch (op) {
             case GGML_OP_POOL_AVG: res += cur;                break;
             case GGML_OP_POOL_MAX: res = max(res, cur);       break;

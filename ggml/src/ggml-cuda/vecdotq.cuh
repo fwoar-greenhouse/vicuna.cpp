@@ -32,7 +32,6 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
 static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, const int8_t * table) {
-#if defined(GGML_USE_HIP)
     // Load the 16-byte table into four 32-bit unsigned integers.
     const uint32_t *values = (const uint32_t *)table;
 
@@ -54,44 +53,6 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
     uint32_t res_y = __builtin_amdgcn_perm(v_odd_high, v_odd_low, mask_odd);
 
     return make_int2(res_x, res_y);
-#elif !defined(GGML_USE_MUSA)
-    // CUDA does not have an instruction for selecting bytes with 4 bit indices.
-    // However, __byte_perm is an instruction that selects bytes with 3 bit indices that can be used instead.
-    const uint32_t * table32 = (const uint32_t *) table;
-
-    // __byte_perm selects bytes based on the lower 16 bits in its third argument.
-    // Therefore, do 2 iterations over the 32 bits in q4 with 0 and 16 shift.
-    // To handle the fourth bit, first call _byte_perm both for the low and the high 64 bit of table, using the low 3 bits.
-    // Then, call __byte_perm again to select from the low and high bytes based on the fourth bit.
-    uint32_t tmp[2];
-    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
-#pragma unroll
-    for (uint32_t i = 0; i < 2; ++i) {
-        const uint32_t shift = 16 * i;
-
-        const uint32_t low  = __byte_perm(table32[0], table32[1], q4 >> shift);
-        const uint32_t high = __byte_perm(table32[2], table32[3], q4 >> shift);
-        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
-    }
-
-    // tmp contains the bytes from tyble in the same order as the 4 bit indices in q4.
-    // However, for the result we need ints with all even/odd 4 bit indices in q4.
-    // Therefore, 2 more calls to __byte_perm to put the bytes in the correct order.
-    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
-#else
-    // Generic implementation.
-    const int      q0_32  = (q4 >> 0) & 0x0F0F0F0F;
-    const int8_t * q0_8   = (const int8_t *) &q0_32;
-    const char4    val0_8 = make_char4(
-        table[q0_8[0]], table[q0_8[1]], table[q0_8[2]], table[q0_8[3]]);
-
-    const int      q1_32  = (q4 >> 4) & 0x0F0F0F0F;
-    const int8_t * q1_8   = (const int8_t *) &q1_32;
-    const char4    val1_8 = make_char4(
-        table[q1_8[0]], table[q1_8[1]], table[q1_8[2]], table[q1_8[3]]);
-
-    return make_int2(*((const int *) &val0_8), *((const int *) &val1_8));
-#endif
 }
 
 static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
@@ -747,20 +708,11 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
         const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
 
-#if defined(GGML_USE_HIP)
         const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
         const uint32_t qy_bits    = q >> 8;
         const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
         const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
         const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
-#else
-        // unpack even and odd crumbs into byte values
-        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
-        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
-        // unshuffle values
-        const int qx = __byte_perm(qe, qo, 0x5140);
-        const int qy = __byte_perm(qe, qo, 0x7362);
-#endif // defined(GGML_USE_HIP)
 
         sumi = ggml_cuda_dp4a(u, qx, sumi);
         sumi = ggml_cuda_dp4a(v, qy, sumi);

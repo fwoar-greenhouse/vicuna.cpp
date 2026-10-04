@@ -157,9 +157,9 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
     const int pos0 = y0 * sy * iw + x0 * sx, pos1 = y1 * sy * iw + x1 * sx;
 
     [[maybe_unused]] const int wm = threadIdx.y / 2 * 32, wn = threadIdx.y % 2 * 32;
-#if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
     using tile_ab = tile<16, 8, half2, get_input_data_layout()>;
-#    if defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+#    if defined(AMD_MFMA_AVAILABLE)
     // AMD accumulator fragments transpose the input fragment's row/column mapping.
     using tile_c = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
 #    else
@@ -218,7 +218,7 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
         }
         __syncthreads();
         if constexpr (use_mma) {
-#if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
 #    pragma unroll
             for (int k = 0; k < BK; k += 16) {
                 tile_ab a[2], b[2];
@@ -260,7 +260,7 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
         __syncthreads();
     }
     if constexpr (use_mma) {
-#if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
 #    pragma unroll
         for (int i = 0; i < 2; ++i) {
 #    pragma unroll

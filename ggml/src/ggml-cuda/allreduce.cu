@@ -1,6 +1,5 @@
 #include "allreduce.cuh"
 
-#if !defined(GGML_USE_MUSA)
 
 #include "convert.cuh"
 #include "ggml-impl.h"
@@ -162,14 +161,8 @@ static __global__ void ggml_cuda_ar_kernel(
         __threadfence_system(); // make our signal visible system-wide
 
         while (ggml_cuda_ar_signal_get(other_slot) != token) {
-#ifdef GGML_USE_HIP
             // Equals ~100ns at 2500 MHz (sleeps for n * [1,64] clock cycles)
             __builtin_amdgcn_s_sleep(4);
-#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-            __nanosleep(100);
-#else
-            NO_DEVICE_CODE;
-#endif // GGML_USE_HIP
         }
     }
 
@@ -957,21 +950,3 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
-#else // defined(GGML_USE_MUSA)
-
-// MUSA lacks the host-mapped pinned-memory APIs (cudaHostAllocPortable
-// / cudaHostAllocMapped / cudaHostGetDevicePointer) and a device-side
-// sleep intrinsic that this implementation relies on, so the internal
-// AllReduce is unavailable there. The dispatcher in ggml-cuda.cu treats
-// a nullptr pipeline as "init failed" and silently falls back to the meta
-// backend's generic AllReduce.
-ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
-    return nullptr;
-}
-void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
-}
-bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
-    return false;
-}
-
-#endif // !defined(GGML_USE_MUSA)

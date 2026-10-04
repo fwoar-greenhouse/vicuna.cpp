@@ -4,9 +4,6 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 
-#ifdef GGML_CUDA_USE_CUB
-#   include <cub/cub.cuh>
-#endif // GGML_CUDA_USE_CUB
 
 template<typename T, int BLOCK_SIZE>
 static __global__ void cumsum_cub_kernel(
@@ -15,70 +12,7 @@ static __global__ void cumsum_cub_kernel(
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t  s01, const int64_t  s02, const int64_t  s03,
         const int64_t   s1,  const int64_t   s2,  const int64_t   s3) {
-#ifdef GGML_CUDA_USE_CUB
-    using BlockScanT = cub::BlockScan<T, BLOCK_SIZE>;
-
-    __shared__ typename BlockScanT::TempStorage temp_storage;
-    __shared__ T block_carry;
-
-    const int tid = threadIdx.x;
-    constexpr int UNROLL_FACTOR = 4;
-    constexpr int TILE_SIZE = BLOCK_SIZE * UNROLL_FACTOR;
-
-    const int64_t i1 = blockIdx.x;
-    const int64_t i2 = blockIdx.y;
-    const int64_t i3 = blockIdx.z;
-
-    if (i1 >= ne01 || i2 >= ne02 || i3 >= ne03) {
-        return;
-    }
-
-    const T * src_row = src + i1 * s01 + i2 * s02 + i3 * s03;
-    T *       dst_row = dst + i1 * s1  + i2 * s2  + i3 * s3;
-
-    if (tid == 0) {
-        block_carry = 0;
-    }
-    __syncthreads();
-
-    for (int64_t start = 0; start < ne00; start += TILE_SIZE) {
-        T items[UNROLL_FACTOR];
-        T thread_sum = T(0);
-
-#pragma unroll
-        for (int i = 0; i < UNROLL_FACTOR; i++) {
-            int64_t idx = start + tid * UNROLL_FACTOR + i;
-            T val = (idx < ne00) ? src_row[idx] : T(0);
-            thread_sum += val;
-            items[i] = thread_sum;
-        }
-
-        // Block-wide scan on thread sums
-        T thread_prefix;
-        T block_total;
-        BlockScanT(temp_storage).InclusiveSum(thread_sum, thread_prefix, block_total);
-        __syncthreads();
-
-        // Add offset to each item and store
-        T thread_offset = thread_prefix - thread_sum + block_carry;
-#pragma unroll
-        for (int i = 0; i < UNROLL_FACTOR; i++) {
-            int64_t idx = start + tid * UNROLL_FACTOR + i;
-            if (idx < ne00) {
-                dst_row[idx] = items[i] + thread_offset;
-            }
-        }
-
-        __syncthreads();
-
-        // Update carry for next tile
-        if (tid == 0) {
-            block_carry += block_total;
-        }
-    }
-#else
     NO_DEVICE_CODE;
-#endif // GGML_CUDA_USE_CUB
 }
 
 // Fallback kernel implementation
@@ -185,30 +119,6 @@ static __global__ void cumsum_kernel(
     }
 }
 
-#ifdef GGML_CUDA_USE_CUB
-template <typename T>
-static void cumsum_cub(ggml_cuda_pool & pool,
-                       const T *        src,
-                       T *              dst,
-                       int64_t          ne,
-                       cudaStream_t     stream) {
-    size_t tmp_size = 0;
-
-    // Query how much temp storage CUDA UnBound (CUB) needs
-    cub::DeviceScan::InclusiveSum(nullptr,   // d_temp_storage (null = just query size)
-                                  tmp_size,  // reference to size (will be set by CUB)
-                                  src,       // input pointer
-                                  dst,       // output pointer
-                                  ne,        // number of elements
-                                  stream     // CUDA stream to use
-    );
-
-    ggml_cuda_pool_alloc<uint8_t> tmp_alloc(pool, tmp_size);
-
-    // Perform the inclusive scan
-    cub::DeviceScan::InclusiveSum((void *) tmp_alloc.get(), tmp_size, src, dst, ne, stream);
-}
-#endif // GGML_CUDA_USE_CUB
 
 template<typename T>
 static void cumsum_cuda(
@@ -220,23 +130,6 @@ static void cumsum_cuda(
 
     const size_t type_size = sizeof(T);
     bool use_cub = false;
-#ifdef GGML_CUDA_USE_CUB
-    // Check if we can use CUB (data must be contiguous along innermost dimension)
-    const bool is_contiguous = (nb00 == type_size) && (nb0 == type_size);
-
-    if (is_contiguous) {
-        use_cub = true;
-        const int64_t nrows = ne01 * ne02 * ne03;
-        // TODO: Compare with DeviceSegmentedScan::InclusiveSegmentedSum for nrows > 1 once InclusiveSegmentedSum is released
-        // Heuristics were determined as part of https://github.com/ggml-org/llama.cpp/pull/17004
-        if (((nrows == 1) && (ne00 > 1024)) || (ne00 / nrows > 4096)) {
-            for (int i=0; i<nrows; i++) {
-                cumsum_cub(ctx.pool(), src + i * ne00, dst + i * ne00, ne00, stream);
-            }
-            return;
-        }
-    }
-#endif // GGML_CUDA_USE_CUB
     dim3 grid_dims(ne01, ne02, ne03);
     const auto &info = ggml_cuda_info().devices[ggml_cuda_get_device()];
     const int warp_size = info.warp_size;

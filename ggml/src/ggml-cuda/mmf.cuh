@@ -54,29 +54,17 @@ static __global__ void mul_mat_f(
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
-#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-#if defined(AMD_WMMA_AVAILABLE)
-    if constexpr (!(std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>) || rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
-    typedef tile<16, 8,  T,     get_input_data_layout()> tile_A;
-    typedef tile<16, 8,  T,     get_input_data_layout()> tile_B;
-    typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR>     tile_C;
-#elif defined(AMD_MFMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
+#if   defined(AMD_MFMA_AVAILABLE)
     if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK_CDNA) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8,  T,     DATA_LAYOUT_I_MAJOR> tile_A;
     typedef tile<16, 8,  T,     DATA_LAYOUT_I_MAJOR> tile_B;
     typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR> tile_C;
 #else
-#ifdef VOLTA_MMA_AVAILABLE
-    if constexpr (!std::is_same_v<T, half2> || rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
-    typedef tile<32, 4, T,     DATA_LAYOUT_I_MAJOR>          tile_A;
-    typedef tile< 8, 4, T,     DATA_LAYOUT_I_MAJOR_MIRRORED> tile_B;
-    typedef tile<32, 8, float, DATA_LAYOUT_I_MAJOR>          tile_C;
-#else
     if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8, T>     tile_A;
     typedef tile<8,  8, T>     tile_B;
     typedef tile<16, 8, float> tile_C;
-#endif // VOLTA_MMA_AVAILABLE
 #endif // defined(AMD_WMMA_AVAILABLE)
     if constexpr (!tile_A::supported() || !tile_B::supported() || !tile_C::supported()) {
         NO_DEVICE_CODE;
@@ -314,29 +302,17 @@ static __global__ void mul_mat_f_ids(
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 sis1_fd, const uint3 nch_fd) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
-#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-#if defined(AMD_WMMA_AVAILABLE)
-    if constexpr (!(std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>) || rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
-    typedef tile<16, 8,  T,     get_input_data_layout()> tile_A;
-    typedef tile<16, 8,  T,     get_input_data_layout()> tile_B;
-    typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR>     tile_C;
-#elif defined(AMD_MFMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
+#if   defined(AMD_MFMA_AVAILABLE)
     if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK_CDNA) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8,  T,     DATA_LAYOUT_I_MAJOR> tile_A;
     typedef tile<16, 8,  T,     DATA_LAYOUT_I_MAJOR> tile_B;
     typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR> tile_C;
 #else
-#ifdef VOLTA_MMA_AVAILABLE
-    if constexpr (!std::is_same_v<T, half2> || rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
-    typedef tile<32, 4, T,     DATA_LAYOUT_I_MAJOR>          tile_A;
-    typedef tile< 8, 4, T,     DATA_LAYOUT_I_MAJOR_MIRRORED> tile_B;
-    typedef tile<32, 8, float, DATA_LAYOUT_I_MAJOR>          tile_C;
-#else
     if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8, T>     tile_A;
     typedef tile<8,  8, T>     tile_B;
     typedef tile<16, 8, float> tile_C;
-#endif // VOLTA_MMA_AVAILABLE
 #endif // defined(AMD_WMMA_AVAILABLE)
     if constexpr (!tile_A::supported() || !tile_B::supported() || !tile_C::supported()) {
         NO_DEVICE_CODE;
@@ -889,7 +865,6 @@ static void mul_mat_f_switch_rows_per_block(
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst, \
         cudaStream_t stream, const mmf_ids_data * ids_data);
 
-#if !defined(GGML_USE_MUSA)
 #define DECL_MMF_CASE_EXTERN(ncols_dst) \
     extern DECL_MMF_CASE_HELPER(float, MMF_ROWS_PER_BLOCK, ncols_dst) \
     extern DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK, ncols_dst) \
@@ -922,6 +897,3 @@ DECL_MMF_CASE_EXTERN(13);
 DECL_MMF_CASE_EXTERN(14);
 DECL_MMF_CASE_EXTERN(15);
 DECL_MMF_CASE_EXTERN(16);
-#else
-#define DECL_MMF_CASE(ncols_dst)
-#endif

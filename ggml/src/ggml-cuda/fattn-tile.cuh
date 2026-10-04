@@ -326,19 +326,7 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
 }
 
 static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols) {
-#ifdef GGML_USE_HIP
-#ifdef RDNA
-    return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
-#else
     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
-#endif // RDNA
-#else
-#ifdef FAST_FP16_AVAILABLE
-    return ggml_cuda_fattn_tile_get_config_nvidia_fp16(DKQ, DV, ncols);
-#else
-    return ggml_cuda_fattn_tile_get_config_nvidia_fp32(DKQ, DV, ncols);
-#endif // FAST_FP16_AVAILABLE
-#endif // GGML_USE_HIP
 }
 
 static __host__ int ggml_cuda_fattn_tile_get_nthreads(const int DKQ, const int DV, const int ncols, const int cc) {
@@ -1155,7 +1143,6 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
     constexpr size_t nbytes_shared = 0;
 
-#ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
         if (Q->ne[1] > 32/ncols2) {
             constexpr int cols_per_block = 64;
@@ -1167,11 +1154,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             return;
         }
     }
-#endif // GGML_USE_HIP
 
-#ifndef GGML_USE_HIP
-    if constexpr (DKQ <= 256)
-#endif // GGML_USE_HIP
     {
         if (Q->ne[1] > 16/ncols2) {
             constexpr int cols_per_block = 32;
@@ -1257,17 +1240,10 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
         // On AMD, simply use that GQA ratio with 32 columns / block since we always have enough SRAM.
         // On NVIDIA however, the tile kernel is only used for GPUs that can't use the mma kernel (Pascal and older).
         // Therefore, use a GQA ratio of 16 with 16 columns / block to stay below 48 kiB of SRAM / block.
-#ifdef GGML_USE_HIP
         if (use_gqa_opt && gqa_ratio % 32 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 32, use_logit_softcap>(ctx, dst);
             return;
         }
-#else
-        if (use_gqa_opt && gqa_ratio % 16 == 0) {
-            launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap>(ctx, dst);
-            return;
-        }
-#endif // GGML_USE_HIP
         GGML_ABORT("flash-attn tile (320/256): expected GQA ratio multiple of 32");
     }
 

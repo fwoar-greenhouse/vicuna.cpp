@@ -180,66 +180,15 @@
 
 #define __CUDA_ARCH__ 1300
 
-#if defined(__gfx900__) || defined(__gfx906__) || defined(__gfx909__) || defined(__gfx90c__)
-#define GCN5
-#endif // defined(__gfx900__) || defined(__gfx906__) || defined(__gfx909__) || defined(__gfx90c__)
-
-#if defined(__gfx803__)
-#define GCN4
-#endif // defined(__gfx803__)
-
-#if defined(GCN5) || defined(GCN4)
-#define GCN
-#endif // defined(GCN5) || defined(GCN4)
-
-#if defined(__gfx950__)
-#define CDNA4
-#endif // defined(__gfx950__)
-
-#if defined(__gfx942__)
-#define CDNA3
-#endif // defined(__gfx942__)
-
-#if defined(__gfx90a__)
-#define CDNA2
-#endif // defined(__gfx90a__)
+// Only AMD MI100 (gfx908) is supported. The arch macros exist only in the device pass.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx908__)
+#error "This build supports only gfx908 (MI100)"
+#endif // defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx908__)
 
 #if defined(__gfx908__)
 #define CDNA1
+#define CDNA
 #endif // defined(__gfx908__)
-
-#if defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
-#define CDNA // For the entire family
-#endif // defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
-
-#if defined(__GFX12__)
-#define RDNA4
-#endif // defined(__GFX12__)
-
-#if defined(__GFX11__)
-#define RDNA3
-#endif // defined(__GFX11__)
-
-#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
-#define RDNA3_5
-#endif // defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
-
-#if defined(RDNA3) && !defined(RDNA3_5)
-#define RDNA3_0
-#endif // defined(RDNA3) && !defined(RDNA3_5)
-
-#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
-    defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__) || defined(__gfx1037__)
-#define RDNA2
-#endif
-
-#if defined(__gfx1010__) || defined(__gfx1012__)
-#define RDNA1
-#endif // defined(__gfx1010__) || defined(__gfx1012__)
-
-#if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
-#define RDNA // For the entire family
-#endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
 
 #ifndef __has_builtin
     #define __has_builtin(x) 0
