@@ -120,26 +120,26 @@ static int mmvq_max_ncols(const ggml_type type, const bool large) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return large ? 1 : 2;
         case GGML_TYPE_Q2_0:    return large ? 5 : 6;
-        case GGML_TYPE_Q4_0:    return large ? 6 : 7;
-        case GGML_TYPE_Q4_1:    return large ? 6 : 7;
-        case GGML_TYPE_Q5_0:    return large ? 7 : 8;
-        case GGML_TYPE_Q5_1:    return large ? 7 : 8;
-        case GGML_TYPE_Q8_0:    return large ? 5 : 7;
+        case GGML_TYPE_Q4_0:    return large ? 5 : 7;
+        case GGML_TYPE_Q4_1:    return large ? 5 : 7;
+        case GGML_TYPE_Q5_0:    return large ? 6 : 7;
+        case GGML_TYPE_Q5_1:    return large ? 5 : 6;
+        case GGML_TYPE_Q8_0:    return large ? 4 : 7;
         case GGML_TYPE_Q2_K:    return large ? 2 : 3;
         case GGML_TYPE_Q3_K:    return large ? 1 : 2;
-        case GGML_TYPE_Q4_K:    return large ? 3 : 4;
-        case GGML_TYPE_Q5_K:    return large ? 3 : 4;
-        case GGML_TYPE_Q6_K:    return 5;
-        case GGML_TYPE_IQ1_S:   return large ? 6 : 7;
+        case GGML_TYPE_Q4_K:    return large ? 2 : 4;
+        case GGML_TYPE_Q5_K:    return large ? 2 : 4;
+        case GGML_TYPE_Q6_K:    return large ? 4 : 5;
+        case GGML_TYPE_IQ1_S:   return large ? 4 : 5;
         case GGML_TYPE_IQ2_XXS: return large ? 4 : 5;
         case GGML_TYPE_IQ2_XS:  return large ? 3 : 4;
         case GGML_TYPE_IQ2_S:   return large ? 4 : 5;
         case GGML_TYPE_IQ3_XXS: return large ? 4 : 5;
         case GGML_TYPE_IQ3_S:   return large ? 4 : 5;
-        case GGML_TYPE_IQ4_NL:  return large ? 5 : 6;
-        case GGML_TYPE_IQ4_XS:  return large ? 7 : 8;
-        case GGML_TYPE_MXFP4:   return large ? 7 : 8;
-        case GGML_TYPE_NVFP4:   return large ? 2 : 3;
+        case GGML_TYPE_IQ4_NL:  return large ? 4 : 5;
+        case GGML_TYPE_IQ4_XS:  return large ? 3 : 6;
+        case GGML_TYPE_MXFP4:   return large ? 4 : 5;
+        case GGML_TYPE_NVFP4:   return large ? 1 : 2;
         default:                return MMVQ_MAX_BATCH_SIZE; // MMQ not supported, the fallback is cuBLAS
     }
 }
