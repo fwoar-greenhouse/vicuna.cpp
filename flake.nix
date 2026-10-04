@@ -70,6 +70,8 @@
       # Nix already uses cryptographic hashes for versioning, so we'll just fix
       # the fake semver for now:
       llamaVersion = "0.0.0";
+      # Reported by llama-server --version; the build sandbox has no .git
+      llamaCommit = self.shortRev or self.dirtyShortRev or "unknown";
     in
     flake-parts.lib.mkFlake { inherit inputs; }
 
@@ -79,7 +81,6 @@
           .devops/nix/nixpkgs-instances.nix
           .devops/nix/apps.nix
           .devops/nix/devshells.nix
-          .devops/nix/jetson-support.nix
         ];
 
         # An overlay can be used to have a more granular control over llama-cpp's
@@ -104,7 +105,7 @@
         # Cf. https://nixos.org/manual/nix/unstable/command-ref/new-cli/nix3-flake.html?highlight=flake#flake-format
         flake.overlays.default = (
           final: prev: {
-            llamaPackages = final.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
+            llamaPackages = final.callPackage .devops/nix/scope.nix { inherit llamaVersion llamaCommit; };
             inherit (final.llamaPackages) llama-cpp;
           }
         );
@@ -121,7 +122,6 @@
             lib,
             system,
             pkgs,
-            pkgsCuda,
             pkgsRocm,
             ...
           }:
@@ -138,12 +138,8 @@
             # access them as `nix build .#llamaPackages.${scriptName}` using
             # the same path you would with an overlay.
             legacyPackages = {
-              llamaPackages = pkgs.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
-              llamaPackagesWindows = pkgs.pkgsCross.mingwW64.callPackage .devops/nix/scope.nix {
-                inherit llamaVersion;
-              };
-              llamaPackagesCuda = pkgsCuda.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
-              llamaPackagesRocm = pkgsRocm.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
+              llamaPackages = pkgs.callPackage .devops/nix/scope.nix { inherit llamaVersion llamaCommit; };
+              llamaPackagesRocm = pkgsRocm.callPackage .devops/nix/scope.nix { inherit llamaVersion llamaCommit; };
             };
 
             # We don't use the overlay here so as to avoid making too many instances of nixpkgs,
@@ -151,15 +147,10 @@
             packages =
               {
                 default = config.legacyPackages.llamaPackages.llama-cpp;
-                vulkan = config.packages.default.override { useVulkan = true; };
-                windows = config.legacyPackages.llamaPackagesWindows.llama-cpp;
                 python-scripts = config.legacyPackages.llamaPackages.python-scripts;
               }
               // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-                cuda = config.legacyPackages.llamaPackagesCuda.llama-cpp;
-
                 mpi-cpu = config.packages.default.override { useMpi = true; };
-                mpi-cuda = config.packages.default.override { useMpi = true; };
               }
               // lib.optionalAttrs (system == "x86_64-linux") {
                 rocm = config.legacyPackages.llamaPackagesRocm.llama-cpp;
@@ -172,7 +163,7 @@
             #
             # TODO: Build more once https://github.com/ggml-org/llama.cpp/issues/6346 has been addressed
             checks = {
-              inherit (config.packages) default vulkan;
+              inherit (config.packages) default;
             };
           };
       };

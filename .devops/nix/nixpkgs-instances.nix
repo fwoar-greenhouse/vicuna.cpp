@@ -19,22 +19,6 @@
         # Note that you can use these expressions without Nix
         # (`pkgs.callPackage ./devops/nix/scope.nix { }` is the entry point).
 
-        pkgsCuda = import inputs.nixpkgs {
-          inherit system;
-          # Ensure dependencies use CUDA consistently (e.g. that openmpi, ucc,
-          # and ucx are built with CUDA support)
-          config.cudaSupport = true;
-          config.allowUnfreePredicate =
-            p:
-            builtins.all (
-              license:
-              license.free
-              || builtins.elem license.shortName [
-                "CUDA EULA"
-                "cuDNN EULA"
-              ]
-            ) (p.meta.licenses or (lib.toList p.meta.license));
-        };
         # Ensure dependencies use ROCm consistently
         pkgsRocm = import inputs.nixpkgs {
           inherit system;

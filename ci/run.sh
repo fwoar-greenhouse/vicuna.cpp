@@ -7,23 +7,8 @@
 # # CPU-only build
 # bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
-# # with CUDA support
-# GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with ROCm support
-# GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with SYCL support
-# GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with VULKAN support
-# GG_BUILD_VULKAN=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with WebGPU support
-# GG_BUILD_WEBGPU=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# # with MUSA support
-# GG_BUILD_MUSA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+# # with ROCm support (MI100)
+# GG_BUILD_ROCM=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
 # # with KLEIDIAI support
 # GG_BUILD_KLEIDIAI=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
@@ -33,9 +18,6 @@
 #
 # with BLAS support (custom vendor)
 # GG_BUILD_BLAS=1 GG_BUILD_BLAS_VENDOR=Intel10_64lp bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
-# with OPENVINO support
-# GG_BUILD_OPENVINO=1 GG_BUILD_LOW_PERF=1 GGML_OPENVINO_DEVICE=CPU bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
 
 if [ -z "$2" ]; then
@@ -65,94 +47,9 @@ if [ ! -z "${GG_BUILD_NINJA}" ]; then
     CMAKE_GENERATOR="Ninja"
 fi
 
-if [ ! -z ${GG_BUILD_METAL} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=ON"
-else
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=OFF"
-fi
-
-if [ ! -z ${GG_BUILD_CUDA} ]; then
-    # TODO: Drop GGML_CUDA_CCCL_VERSION when CUDA CI uses CTK >= 13.5, which bundles CCCL >= 3.5.
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_CUDA=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3"
-
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '.')
-        if [[ -n "$CUDA_ARCH" && "$CUDA_ARCH" =~ ^[0-9]+$ ]]; then
-            CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"
-        else
-            echo "Warning: Using fallback CUDA architectures"
-            CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_CUDA_ARCHITECTURES=61;70;75;80;86;89"
-        fi
-    else
-        echo "Error: nvidia-smi not found, cannot build with CUDA"
-        exit 1
-    fi
-fi
-
 if [ ! -z ${GG_BUILD_ROCM} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang -DGGML_HIP=ON"
-    if [ -z ${GG_BUILD_AMDGPU_TARGETS} ]; then
-        echo "Missing GG_BUILD_AMDGPU_TARGETS, please set it to your GPU architecture (e.g. gfx90a, gfx1100, etc.)"
-        exit 1
-    fi
-
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGPU_TARGETS=${GG_BUILD_AMDGPU_TARGETS}"
-fi
-
-if [ ! -z ${GG_BUILD_SYCL} ]; then
-    if [ -z ${ONEAPI_ROOT} ]; then
-        echo "Not detected ONEAPI_ROOT, please install oneAPI base toolkit and enable it by:"
-        echo "source /opt/intel/oneapi/setvars.sh"
-        exit 1
-    fi
-    # Use only main GPU
-    export ONEAPI_DEVICE_SELECTOR="level_zero:0"
-    # Enable sysman for correct memory reporting
-    export ZES_ENABLE_SYSMAN=1
-    # to circumvent precision issues on CPY operations
-    export SYCL_PROGRAM_COMPILE_OPTIONS="-cl-fp32-correctly-rounded-divide-sqrt"
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_SYCL=1 -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON"
-fi
-
-if [ ! -z ${GG_BUILD_VULKAN} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_VULKAN=1"
-
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION="/usr/local/lib/cmake/vulkan"
-        MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION="${MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION}/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
-        if [[ -f "${MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION}" || -h "${MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION}" ]]; then
-            CMAKE_EXTRA="${CMAKE_EXTRA} -DSPIRV-Headers_DIR=${MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION}/SPIRV-Headers"
-        fi
-    fi
-
-    # Build shared libs on Windows
-    # to reduce binary size and avoid errors in library loading unit tests
-    if uname -s | grep -qi nt; then
-        CMAKE_EXTRA="${CMAKE_EXTRA} -DBUILD_SHARED_LIBS=ON"
-    fi
-fi
-
-if [ ! -z ${GG_BUILD_WEBGPU} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_WEBGPU=1"
-
-    if [ ! -z "${GG_BUILD_WEBGPU_DAWN_PREFIX}" ]; then
-        if [ -z "${CMAKE_PREFIX_PATH}" ]; then
-            export CMAKE_PREFIX_PATH="${GG_BUILD_WEBGPU_DAWN_PREFIX}"
-        else
-            export CMAKE_PREFIX_PATH="${GG_BUILD_WEBGPU_DAWN_PREFIX}:${CMAKE_PREFIX_PATH}"
-        fi
-    fi
-
-    # For some systems, Dawn_DIR needs to be set explicitly, e.g., the lib64 path
-    if [ ! -z "${GG_BUILD_WEBGPU_DAWN_DIR}" ]; then
-        CMAKE_EXTRA="${CMAKE_EXTRA} -DDawn_DIR=${GG_BUILD_WEBGPU_DAWN_DIR}"
-    fi
-fi
-
-if [ ! -z ${GG_BUILD_MUSA} ]; then
-    # Use ph1 by default (MTT S5000)
-    MUSA_ARCH=${MUSA_ARCH:-31}
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_MUSA=ON -DMUSA_ARCHITECTURES=${MUSA_ARCH}"
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGPU_TARGETS=gfx908"
 fi
 
 if [ ! -z ${GG_BUILD_NO_SVE} ]; then
@@ -169,18 +66,6 @@ if [ ! -z ${GG_BUILD_BLAS} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=${GG_BUILD_BLAS_VENDOR:-OpenBLAS}"
 else
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_BLAS=OFF"
-fi
-
-if [ ! -z ${GG_BUILD_OPENVINO} ]; then
-    if [ -z ${OpenVINO_DIR} ]; then
-        echo "OpenVINO_DIR not found, please install OpenVINO via archives and enable it by:"
-        echo "source /opt/intel/openvino/setupvars.sh"
-        exit 1
-    fi
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_OPENVINO=ON"
-
-    # TODO: fix failing tests on OpenVINO backend
-    CTEST_EXTRA="-E test-llama-archs|^test-recurrent-state-|test-save-load-state"
 fi
 
 ## helpers
@@ -269,18 +154,11 @@ function gg_run_test_llama_archs_tensor_split {
 
     set -e
 
-    if [ ! -z ${GG_BUILD_CUDA} ]; then
+    if [ ! -z ${GG_BUILD_ROCM} ]; then
         GGML_CUDA_DEVICES=1 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
         GGML_CUDA_DEVICES=2 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
         GGML_CUDA_DEVICES=3 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
         GGML_CUDA_DEVICES=4 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
-    fi
-
-    if [ ! -z ${GG_BUILD_METAL} ]; then
-        GGML_METAL_DEVICES=1 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
-        GGML_METAL_DEVICES=2 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
-        GGML_METAL_DEVICES=3 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
-        GGML_METAL_DEVICES=4 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
     fi
 
     set +e
@@ -293,9 +171,8 @@ function gg_run_test_llama_archs_models {
 
     set -e
 
-    # TODO: fix and re-enable `test-llama-archs` on OpenVINO
     # TODO: the `test-llama-archs` currently does not build on Windows, so we check if the binary exists
-    if [ -z ${GG_BUILD_OPENVINO} ] && [ -f ./build-ci-release/bin/test-llama-archs ]; then
+    if [ -f ./build-ci-release/bin/test-llama-archs ]; then
         rm -rf build-ci-models && mkdir -p build-ci-models
 
         # generate the dummy models used by the model-dependent tests
@@ -350,12 +227,6 @@ function gg_run_ctest_with_model_release {
     set -e
 
     (LLAMACPP_TEST_MODELFILE="$model" time ctest -C Release --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
-
-    # test memory leaks
-    #if [[ ! -z ${GG_BUILD_METAL} ]]; then
-    #    # TODO: this hangs for some reason ...
-    #    (time leaks -quiet -atExit -- ./bin/test-thread-safety -m $model --parallel 2 -t 2 -p "hello") 2>&1 | tee -a $OUT/${ci}-leaks.log
-    #fi
 
     set +e
     cd ..
@@ -652,17 +523,6 @@ function gg_run_test_backend_ops {
     # TODO: fix multi-threaded for ROCm
     #       https://github.com/ggml-org/llama.cpp/actions/runs/34576278519/job/103297889044?pr=28740#step:3:4865
     if [ ! -z ${GG_BUILD_ROCM} ]; then
-        args_extra=""
-    fi
-
-    # TODO: MoltenVK bug?
-    #       https://github.com/ggml-org/llama.cpp/actions/runs/34611260059/job/103302413736?pr=28740#step:3:5897
-    if [ ! -z "${GG_BUILD_VULKAN}" ] && [ "$(uname -s)" = "Darwin" ]; then
-        args_extra=""
-    fi
-
-    # TODO: OpenVINO GPU plugin crashes (CL_OUT_OF_RESOURCES) with 2 concurrent workers on GPU.
-    if [ ! -z "${GG_BUILD_OPENVINO}" ] && [ "${GGML_OPENVINO_DEVICE:-}" = "GPU" ]; then
         args_extra=""
     fi
 

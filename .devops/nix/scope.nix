@@ -3,6 +3,7 @@
   newScope,
   python3,
   llamaVersion ? "0.0.0",
+  llamaCommit ? "unknown",
 }:
 
 let
@@ -28,7 +29,7 @@ lib.makeScope newScope (self: {
       ;
   };
   python-scripts = self.callPackage ./python-scripts.nix { inherit (pythonPackages) buildPythonPackage poetry-core; };
-  llama-cpp = self.callPackage ./package.nix { };
+  llama-cpp = self.callPackage ./package.nix { inherit llamaCommit; };
   docker = self.callPackage ./docker.nix { };
   docker-min = self.callPackage ./docker.nix { interactive = false; };
   sif = self.callPackage ./sif.nix { };
