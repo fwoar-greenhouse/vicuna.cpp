@@ -92,13 +92,22 @@ bool ggml_cuda_repack_supports_op(const ggml_tensor * op);
 static constexpr int ggml_cuda_repack_mmvq_max_cols(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0: return 6;
-        case GGML_TYPE_Q8_0: return 6;
-        case GGML_TYPE_Q4_K: return 5;
-        case GGML_TYPE_Q5_K: return 4;
-        case GGML_TYPE_Q6_K: return 6;
-        case GGML_TYPE_IQ4_XS: return 5;
+        case GGML_TYPE_Q8_0: return 8;
+        case GGML_TYPE_Q4_K: return 8;
+        case GGML_TYPE_Q5_K: return 8;
+        case GGML_TYPE_Q6_K: return 8;
+        case GGML_TYPE_IQ4_XS: return 7;
         default:             return GGML_CUDA_REPACK_MMVQ_MAX_COLS;
     }
+}
+
+// The same for a weight: all columns for matrices with few rows (too few MMQ tiles), at most 6 below 16M weights.
+static int ggml_cuda_repack_mmvq_max_cols(const ggml_tensor * src0) {
+    if (src0->ne[1] < 1024) {
+        return GGML_CUDA_REPACK_MMVQ_MAX_COLS;
+    }
+    const int n = ggml_cuda_repack_mmvq_max_cols(src0->type);
+    return src0->ne[0]*src0->ne[1] < 16*1024*1024 ? std::min(n, 6) : n;
 }
 
 // GEMV on a repacked src0 (MUL_MAT up to 8 columns, MUL_MAT_ID up to 8 tokens), y is q8_1, arguments as in mmvq.cu.

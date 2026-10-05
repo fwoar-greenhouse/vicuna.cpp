@@ -7,8 +7,19 @@
 // GEMV on repacked weights (MMVQ-R): one lane = one row, a wave = one stripe of 64 rows,
 // the waves of a block split K. Each lane loads the chunks of its own block (1 KB contiguous per wave
 // and load instruction). The q8_1 activation is the same for all lanes and is read with scalar loads.
+// The kernel is latency bound: the weight loads of a unit and its math do not overlap inside a wave,
+// so it needs 3+ waves per SIMD (few VGPRs: buffer loads, loop counters in SGPRs) and enough blocks.
 
 #define MMVQ_REPACK_MAX_WARPS 8
+// blocks per loop step for Q4_0 / Q8_0 (Q4_0 with 8 spills at 3 waves per SIMD, Q8_0 with 4 is slower)
+static constexpr int mmvq_repack_g(const ggml_type type, const int ncols) {
+    return type == GGML_TYPE_Q4_0 ? (ncols == 1 ? 8 : 4) : type == GGML_TYPE_Q8_0 ? 8 : 1;
+}
+
+// waves per SIMD that the kernel is compiled for (the gate needs more VGPRs)
+static constexpr int mmvq_repack_waves_per_eu(const ggml_type type, const int ncols, const bool has_gate) {
+    return has_gate ? 2 : 3;
+}
 
 struct mmvq_repack_args {
     const char       * x;
@@ -42,8 +53,29 @@ struct mmvq_repack_args {
 template <ggml_type type, int ncols>
 struct mmvq_repack_block;
 
-// For the K-quants a loop step is one block (G = 1). For Q4_0/Q8_0 it is a group of G = 8 blocks,
-// whose d values are one 16 byte rest chunk.
+// Buffer resource for raw loads from p (num_records is the maximum, no range check that matters).
+// p is the same for all lanes; readfirstlane keeps it in SGPRs, else the compiler emits waterfall loops.
+static __device__ __forceinline__ __amdgpu_buffer_rsrc_t ggml_cuda_repack_buffer_rsrc(const char * p) {
+    const uint64_t pa = (uint64_t) p;
+    const uint64_t pu = (uint64_t) (uint32_t) __builtin_amdgcn_readfirstlane((uint32_t) pa) | ((uint64_t) (uint32_t) __builtin_amdgcn_readfirstlane((uint32_t) (pa >> 32)) << 32);
+    return __builtin_amdgcn_make_buffer_rsrc((void *) pu, (short) 0, 0x7fffffff, 0x00020000);
+}
+
+static __device__ __forceinline__ int4 ggml_cuda_repack_buffer_load(const __amdgpu_buffer_rsrc_t r, const int voff, const int soff) {
+    const auto t = __builtin_amdgcn_raw_buffer_load_b128(r, voff, soff, 0);
+    return make_int4(t[0], t[1], t[2], t[3]);
+}
+
+// y of one q8_1 block per column (in SGPRs), loaded one sub-block ahead of the math
+template <int ncols>
+struct mmvq_repack_ysub {
+    int    q[ncols][8];
+    float2 d[ncols];
+};
+
+// A unit of the loop is G blocks. For the K-quants it is one block (G = 1), for Q4_0/Q8_0 G blocks
+// whose d values are 8 or 16 bytes of one rest chunk. A sub-block is one q8_1 block of y (8 per K-quant block).
+// init: per unit, sub: one sub-block s, fin: add the unit to acc.
 
 // Q4_K chunks: 0 = d, dmin, scales; 1-8 = qs.
 template <int ncols>
@@ -51,40 +83,53 @@ struct mmvq_repack_block<GGML_TYPE_Q4_K, ncols> {
     static constexpr int nchunk = 9;
     static constexpr int G      = 1;
 
-    static __device__ __forceinline__ void dot(const int4 * v, const int *, const block_q8_1 * const * y, float * acc) {
-        const int * q = (const int *) v;
-        const float2 dm = __half22float2(*(const half2 *) &q[0]);
-        const int scs[2] = {q[1] & 0x3f3f3f3f, (q[3] & 0x0f0f0f0f) | ((q[1] >> 2) & 0x30303030)};
-        const int ms[2]  = {q[2] & 0x3f3f3f3f, ((q[3] >> 4) & 0x0f0f0f0f) | ((q[2] >> 2) & 0x30303030)};
-        const int * qs = q + 4;
-        float sumd[ncols] = {0.0f};
-        float summ[ncols] = {0.0f};
-#pragma unroll
-        for (int s = 0; s < 8; ++s) {
-            int vv[8];
-#pragma unroll
-            for (int m = 0; m < 8; ++m) {
-                vv[m] = (qs[(s >> 1)*8 + m] >> (4*(s & 1))) & 0x0f0f0f0f;
-            }
-            const int scv = (scs[s >> 2] >> (8*(s & 3))) & 0xff;
-            const int mv  = (ms[s >> 2]  >> (8*(s & 3))) & 0xff;
-#pragma unroll
-            for (int j = 0; j < ncols; ++j) {
-                const block_q8_1 * yb = y[j] + s;
-                const int * yq = (const int *) yb->qs;
-                int dot = 0;
-#pragma unroll
-                for (int m = 0; m < 8; ++m) {
-                    dot = ggml_cuda_dp4a(vv[m], yq[m], dot);
-                }
-                const float2 ds = __half22float2(yb->ds);
-                sumd[j] += ds.x * (float) (dot*scv);
-                summ[j] += ds.y * (float) mv;
-            }
-        }
+    struct state {
+        float2 dm;
+        int    scs[2];
+        int    ms[2];
+        float  sumd[ncols];
+        float  summ[ncols];
+    };
+
+    static __device__ __forceinline__ void init(const int4 (*v)[nchunk], const int (*)[2], state & st) {
+        const int * q = (const int *) v[0];
+        st.dm     = __half22float2(*(const half2 *) &q[0]);
+        st.scs[0] = q[1] & 0x3f3f3f3f;
+        st.scs[1] = (q[3] & 0x0f0f0f0f) | ((q[1] >> 2) & 0x30303030);
+        st.ms[0]  = q[2] & 0x3f3f3f3f;
+        st.ms[1]  = ((q[3] >> 4) & 0x0f0f0f0f) | ((q[2] >> 2) & 0x30303030);
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            acc[j] += dm.x*sumd[j] - dm.y*summ[j];
+            st.sumd[j] = 0.0f;
+            st.summ[j] = 0.0f;
+        }
+    }
+
+    static __device__ __forceinline__ void sub(const int4 (*v)[nchunk], const int (*)[2], const int s, const mmvq_repack_ysub<ncols> & y, state & st, float *) {
+        const int * qs = (const int *) v[0] + 4;
+        int vv[8];
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            vv[m] = (qs[(s >> 1)*8 + m] >> (4*(s & 1))) & 0x0f0f0f0f;
+        }
+        const int scv = (st.scs[s >> 2] >> (8*(s & 3))) & 0xff;
+        const int mv  = (st.ms[s >> 2]  >> (8*(s & 3))) & 0xff;
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            int dot = 0;
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                dot = ggml_cuda_dp4a(vv[m], y.q[j][m], dot);
+            }
+            st.sumd[j] += y.d[j].x * (float) (dot*scv);
+            st.summ[j] += y.d[j].y * (float) mv;
+        }
+    }
+
+    static __device__ __forceinline__ void fin(const state & st, float * acc) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            acc[j] += st.dm.x*st.sumd[j] - st.dm.y*st.summ[j];
         }
     }
 };
@@ -93,46 +138,55 @@ struct mmvq_repack_block<GGML_TYPE_Q4_K, ncols> {
 template <int ncols>
 struct mmvq_repack_block<GGML_TYPE_Q8_0, ncols> {
     static constexpr int nchunk = 2;
-    static constexpr int G      = 8;
+    static constexpr int G      = mmvq_repack_g(GGML_TYPE_Q8_0, ncols);
 
-    static __device__ __forceinline__ void dot(const int4 * v, const int * rest, const block_q8_1 * const * y, float * acc) {
-        const float d = __half2float(__ushort_as_half((uint16_t) rest[0]));
-        const int * q = (const int *) v;
+    struct state {};
+
+    static __device__ __forceinline__ void init(const int4 (*)[nchunk], const int (*)[2], state &) {}
+
+    static __device__ __forceinline__ void sub(const int4 (*v)[nchunk], const int (*rest)[2], const int s, const mmvq_repack_ysub<ncols> & y, state &, float * acc) {
+        const float d = __half2float(__ushort_as_half((uint16_t) rest[s][0]));
+        const int * q = (const int *) v[s];
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            const int * yq = (const int *) y[j]->qs;
             int dot = 0;
 #pragma unroll
             for (int m = 0; m < 8; ++m) {
-                dot = ggml_cuda_dp4a(q[m], yq[m], dot);
+                dot = ggml_cuda_dp4a(q[m], y.q[j][m], dot);
             }
-            acc[j] += d * __low2float(y[j]->ds) * (float) dot;
+            acc[j] += d * y.d[j].x * (float) dot;
         }
     }
+
+    static __device__ __forceinline__ void fin(const state &, float *) {}
 };
 
 // Q4_0: chunk 0 = qs, rest = d.
 template <int ncols>
 struct mmvq_repack_block<GGML_TYPE_Q4_0, ncols> {
     static constexpr int nchunk = 1;
-    static constexpr int G      = 8;
+    static constexpr int G      = mmvq_repack_g(GGML_TYPE_Q4_0, ncols);
 
-    static __device__ __forceinline__ void dot(const int4 * v, const int * rest, const block_q8_1 * const * y, float * acc) {
-        const float d = __half2float(__ushort_as_half((uint16_t) rest[0]));
-        const int * q = (const int *) v;
+    struct state {};
+
+    static __device__ __forceinline__ void init(const int4 (*)[nchunk], const int (*)[2], state &) {}
+
+    static __device__ __forceinline__ void sub(const int4 (*v)[nchunk], const int (*rest)[2], const int s, const mmvq_repack_ysub<ncols> & y, state &, float * acc) {
+        const float d = __half2float(__ushort_as_half((uint16_t) rest[s][0]));
+        const int * q = (const int *) v[s];
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            const int * yq = (const int *) y[j]->qs;
             int dot = 0;
 #pragma unroll
             for (int m = 0; m < 4; ++m) {
-                dot = ggml_cuda_dp4a((q[m] >> 0) & 0x0f0f0f0f, yq[m + 0], dot);
-                dot = ggml_cuda_dp4a((q[m] >> 4) & 0x0f0f0f0f, yq[m + 4], dot);
+                dot = ggml_cuda_dp4a((q[m] >> 0) & 0x0f0f0f0f, y.q[j][m + 0], dot);
+                dot = ggml_cuda_dp4a((q[m] >> 4) & 0x0f0f0f0f, y.q[j][m + 4], dot);
             }
-            const float2 ds = __half22float2(y[j]->ds);
-            acc[j] += d * (ds.x*dot - 8.0f*ds.y);
+            acc[j] += d * (y.d[j].x*dot - 8.0f*y.d[j].y);
         }
     }
+
+    static __device__ __forceinline__ void fin(const state &, float *) {}
 };
 
 // Q5_K chunks: 0 = d, dmin, scales; 1-2 = qh; 3-10 = qs.
@@ -141,42 +195,46 @@ struct mmvq_repack_block<GGML_TYPE_Q5_K, ncols> {
     static constexpr int nchunk = 11;
     static constexpr int G      = 1;
 
-    static __device__ __forceinline__ void dot(const int4 * v, const int *, const block_q8_1 * const * y, float * acc) {
-        const int * q = (const int *) v;
-        const float2 dm = __half22float2(*(const half2 *) &q[0]);
-        const int scs[2] = {q[1] & 0x3f3f3f3f, (q[3] & 0x0f0f0f0f) | ((q[1] >> 2) & 0x30303030)};
-        const int ms[2]  = {q[2] & 0x3f3f3f3f, ((q[3] >> 4) & 0x0f0f0f0f) | ((q[2] >> 2) & 0x30303030)};
-        const int * qh = q + 4;
-        const int * qs = q + 12;
-        float sumd[ncols] = {0.0f};
-        float summ[ncols] = {0.0f};
-#pragma unroll
-        for (int s = 0; s < 8; ++s) {
-            int vv[8];
-#pragma unroll
-            for (int m = 0; m < 8; ++m) {
-                vv[m] = ((qs[(s >> 1)*8 + m] >> (4*(s & 1))) & 0x0f0f0f0f) | (((qh[m] >> s) & 0x01010101) << 4);
-            }
-            const int scv = (scs[s >> 2] >> (8*(s & 3))) & 0xff;
-            const int mv  = (ms[s >> 2]  >> (8*(s & 3))) & 0xff;
-#pragma unroll
-            for (int j = 0; j < ncols; ++j) {
-                const block_q8_1 * yb = y[j] + s;
-                const int * yq = (const int *) yb->qs;
-                int dot = 0;
-#pragma unroll
-                for (int m = 0; m < 8; ++m) {
-                    dot = ggml_cuda_dp4a(vv[m], yq[m], dot);
-                }
-                const float2 ds = __half22float2(yb->ds);
-                sumd[j] += ds.x * (float) (dot*scv);
-                summ[j] += ds.y * (float) mv;
-            }
-        }
+    using state = typename mmvq_repack_block<GGML_TYPE_Q4_K, ncols>::state;
+
+    static __device__ __forceinline__ void init(const int4 (*v)[nchunk], const int (*)[2], state & st) {
+        const int * q = (const int *) v[0];
+        st.dm     = __half22float2(*(const half2 *) &q[0]);
+        st.scs[0] = q[1] & 0x3f3f3f3f;
+        st.scs[1] = (q[3] & 0x0f0f0f0f) | ((q[1] >> 2) & 0x30303030);
+        st.ms[0]  = q[2] & 0x3f3f3f3f;
+        st.ms[1]  = ((q[3] >> 4) & 0x0f0f0f0f) | ((q[2] >> 2) & 0x30303030);
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            acc[j] += dm.x*sumd[j] - dm.y*summ[j];
+            st.sumd[j] = 0.0f;
+            st.summ[j] = 0.0f;
         }
+    }
+
+    static __device__ __forceinline__ void sub(const int4 (*v)[nchunk], const int (*)[2], const int s, const mmvq_repack_ysub<ncols> & y, state & st, float *) {
+        const int * qh = (const int *) v[0] + 4;
+        const int * qs = (const int *) v[0] + 12;
+        int vv[8];
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            vv[m] = ((qs[(s >> 1)*8 + m] >> (4*(s & 1))) & 0x0f0f0f0f) | (((qh[m] >> s) & 0x01010101) << 4);
+        }
+        const int scv = (st.scs[s >> 2] >> (8*(s & 3))) & 0xff;
+        const int mv  = (st.ms[s >> 2]  >> (8*(s & 3))) & 0xff;
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            int dot = 0;
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                dot = ggml_cuda_dp4a(vv[m], y.q[j][m], dot);
+            }
+            st.sumd[j] += y.d[j].x * (float) (dot*scv);
+            st.summ[j] += y.d[j].y * (float) mv;
+        }
+    }
+
+    static __device__ __forceinline__ void fin(const state & st, float * acc) {
+        mmvq_repack_block<GGML_TYPE_Q4_K, ncols>::fin(st, acc);
     }
 };
 
@@ -186,37 +244,46 @@ struct mmvq_repack_block<GGML_TYPE_IQ4_XS, ncols> {
     static constexpr int nchunk = 8;
     static constexpr int G      = 1; // one block per step is faster than the rest group of 2
 
-    static __device__ __forceinline__ void dot(const int4 * v, const int * rest, const block_q8_1 * const * y, float * acc) {
-        const int * q = (const int *) v;
-        const float    d        = __half2float(__ushort_as_half((uint16_t) rest[0]));
-        const uint32_t scales_h = (uint32_t) rest[0] >> 16;
-        const uint32_t scales_l = rest[1];
-        float sumf[ncols] = {0.0f};
+    struct state {
+        float d;
+        float sumf[ncols];
+    };
+
+    static __device__ __forceinline__ void init(const int4 (*)[nchunk], const int (*rest)[2], state & st) {
+        st.d = __half2float(__ushort_as_half((uint16_t) rest[0][0]));
 #pragma unroll
-        for (int ib = 0; ib < 8; ++ib) {
-            int vv[8];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int2 t = ggml_cuda_repack_iq4nl_lut(q[4*ib + j]);
-                vv[j + 0] = t.x;
-                vv[j + 4] = t.y;
-            }
-            const int ls = ((scales_l >> (4*ib)) & 0x0F) | (((scales_h >> (2*ib)) & 0x03) << 4);
-#pragma unroll
-            for (int jc = 0; jc < ncols; ++jc) {
-                const block_q8_1 * yb = y[jc] + ib;
-                const int * yq = (const int *) yb->qs;
-                int dot = 0;
-#pragma unroll
-                for (int m = 0; m < 8; ++m) {
-                    dot = ggml_cuda_dp4a(vv[m], yq[m], dot);
-                }
-                sumf[jc] += __low2float(yb->ds) * (float) (dot*(ls - 32));
-            }
+        for (int j = 0; j < ncols; ++j) {
+            st.sumf[j] = 0.0f;
         }
+    }
+
+    static __device__ __forceinline__ void sub(const int4 (*v)[nchunk], const int (*rest)[2], const int ib, const mmvq_repack_ysub<ncols> & y, state & st, float *) {
+        const int * q = (const int *) v[0];
+        const uint32_t scales_h = (uint32_t) rest[0][0] >> 16;
+        const uint32_t scales_l = rest[0][1];
+        int vv[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 t = ggml_cuda_repack_iq4nl_lut(q[4*ib + j]);
+            vv[j + 0] = t.x;
+            vv[j + 4] = t.y;
+        }
+        const int ls = ((scales_l >> (4*ib)) & 0x0F) | (((scales_h >> (2*ib)) & 0x03) << 4);
 #pragma unroll
         for (int jc = 0; jc < ncols; ++jc) {
-            acc[jc] += d*sumf[jc];
+            int dot = 0;
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                dot = ggml_cuda_dp4a(vv[m], y.q[jc][m], dot);
+            }
+            st.sumf[jc] += y.d[jc].x * (float) (dot*(ls - 32));
+        }
+    }
+
+    static __device__ __forceinline__ void fin(const state & st, float * acc) {
+#pragma unroll
+        for (int jc = 0; jc < ncols; ++jc) {
+            acc[jc] += st.d*st.sumf[jc];
         }
     }
 };
@@ -227,52 +294,58 @@ struct mmvq_repack_block<GGML_TYPE_Q6_K, ncols> {
     static constexpr int nchunk = 13;
     static constexpr int G      = 1;
 
-    static __device__ __forceinline__ void dot(const int4 * v, const int * rest, const block_q8_1 * const * y, float * acc) {
-        const float d = __half2float(__ushort_as_half((uint16_t) rest[0]));
-        const int * q = (const int *) v;
-        const int * ql = q;
-        const int * qh = q + 32;
-        const int8_t * sc = (const int8_t *) (q + 48);
-        float sumf[ncols] = {0.0f};
-#pragma unroll
-        for (int n = 0; n < 2; ++n) {
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                const int sb = 4*n + k;
-                int vv[8];
-#pragma unroll
-                for (int m = 0; m < 8; ++m) {
-                    const int lo = (ql[16*n + 8*(k & 1) + m] >> (4*(k >> 1))) & 0x0f0f0f0f;
-                    const int hi = ((qh[8*n + m] >> (2*k)) & 0x03030303) << 4;
-                    // q - 32 per byte, without borrows between the bytes
-                    vv[m] = (((lo | hi) | 0x80808080) - 0x20202020) ^ 0x80808080;
-                }
-                const int sc0 = sc[8*n + 2*k];
-                const int sc1 = sc[8*n + 2*k + 1];
-#pragma unroll
-                for (int j = 0; j < ncols; ++j) {
-                    const block_q8_1 * yb = y[j] + sb;
-                    const int * yq = (const int *) yb->qs;
-                    int dot0 = 0;
-                    int dot1 = 0;
-#pragma unroll
-                    for (int m = 0; m < 4; ++m) {
-                        dot0 = ggml_cuda_dp4a(vv[m],     yq[m],     dot0);
-                        dot1 = ggml_cuda_dp4a(vv[m + 4], yq[m + 4], dot1);
-                    }
-                    sumf[j] += __low2float(yb->ds) * (float) (dot0*sc0 + dot1*sc1);
-                }
-            }
-        }
+    struct state {
+        float d;
+        float sumf[ncols];
+    };
+
+    static __device__ __forceinline__ void init(const int4 (*)[nchunk], const int (*rest)[2], state & st) {
+        st.d = __half2float(__ushort_as_half((uint16_t) rest[0][0]));
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            acc[j] += d*sumf[j];
+            st.sumf[j] = 0.0f;
+        }
+    }
+
+    static __device__ __forceinline__ void sub(const int4 (*v)[nchunk], const int (*)[2], const int sb, const mmvq_repack_ysub<ncols> & y, state & st, float *) {
+        const int * ql = (const int *) v[0];
+        const int * qh = ql + 32;
+        const int8_t * sc = (const int8_t *) (ql + 48);
+        const int n = sb >> 2;
+        const int k = sb & 3;
+        int vv[8];
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const int lo = (ql[16*n + 8*(k & 1) + m] >> (4*(k >> 1))) & 0x0f0f0f0f;
+            const int hi = ((qh[8*n + m] >> (2*k)) & 0x03030303) << 4;
+            // q - 32 per byte, without borrows between the bytes
+            vv[m] = (((lo | hi) | 0x80808080) - 0x20202020) ^ 0x80808080;
+        }
+        const int sc0 = sc[8*n + 2*k];
+        const int sc1 = sc[8*n + 2*k + 1];
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            int dot0 = 0;
+            int dot1 = 0;
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                dot0 = ggml_cuda_dp4a(vv[m],     y.q[j][m],     dot0);
+                dot1 = ggml_cuda_dp4a(vv[m + 4], y.q[j][m + 4], dot1);
+            }
+            st.sumf[j] += y.d[j].x * (float) (dot0*sc0 + dot1*sc1);
+        }
+    }
+
+    static __device__ __forceinline__ void fin(const state & st, float * acc) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            acc[j] += st.d*st.sumf[j];
         }
     }
 };
 
 template <ggml_type type, int ncols, bool has_gate>
-__launch_bounds__(MMVQ_REPACK_MAX_WARPS*64, 1)
+__attribute__((amdgpu_flat_work_group_size(1, MMVQ_REPACK_MAX_WARPS*64), amdgpu_waves_per_eu(mmvq_repack_waves_per_eu(type, ncols, has_gate))))
 static __global__ void mul_mat_vec_q_repack(const mmvq_repack_args a) {
     constexpr ggml_cuda_repack_layout L = ggml_cuda_repack_get_layout(type);
     constexpr int NC = L.nchunk;
@@ -299,7 +372,7 @@ static __global__ void mul_mat_vec_q_repack(const mmvq_repack_args a) {
     if (a.ids) {
         col_dst    = blockIdx.z;
         sample_dst = 0;
-        channel_x  = a.ids[channel_dst + col_dst*a.ids_stride];
+        channel_x  = __builtin_amdgcn_readfirstlane(a.ids[channel_dst + col_dst*a.ids_stride]);
         channel_y  = fastmodulo(channel_dst, a.nchannels_y);
     } else {
         col_dst    = 0;
@@ -318,44 +391,63 @@ static __global__ void mul_mat_vec_q_repack(const mmvq_repack_args a) {
     const int nu  = (nkb + G - 1) / G; // loop steps of G blocks
     const int wg  = kzi*nw + w;
     const int nwg = a.kz*nw;
-    const int u0  = (wg*nu) / nwg;
-    const int u1  = ((wg + 1)*nu) / nwg;
+    // readfirstlane: the division runs on the VALU, the loop counter would stay in a VGPR
+    const int u0  = __builtin_amdgcn_readfirstlane((wg*nu) / nwg);
+    const int u1  = __builtin_amdgcn_readfirstlane(((wg + 1)*nu) / nwg);
 
     float acc[ncols]  = {0.0f};
     float accg[ncols] = {0.0f};
 
-    // a unit of G blocks; only the last unit of a row can be partial, it has its own code without branches in the full one
-    const auto unit = [&](const int u, auto full_tag) {
+    // the weights of the stripe are read with buffer loads: one lane offset for all chunks, the chunk offset in an SGPR
+    const int pstride = __builtin_amdgcn_readfirstlane(nkb*r*16);
+    const __amdgpu_buffer_rsrc_t rx = ggml_cuda_repack_buffer_rsrc(sx);
+    const __amdgpu_buffer_rsrc_t rg = ggml_cuda_repack_buffer_rsrc(has_gate ? sg : sx);
+
+    // registers of one unit of G blocks
+    struct unit_data {
+        int4 v[G][NC];
+        int4 vg[G][has_gate ? NC : 1];
+        int  rw[G][2];
+        int  rg[G][2];
+    };
+    constexpr int bq = ggml_cuda_type_traits<type>::qk/QK8_1; // q8_1 blocks per weight block
+    constexpr int NS = G*bq;                                   // q8_1 blocks per unit ("sub-blocks")
+    constexpr int GR = L.rest > 0 ? 16/L.rest : 1;             // blocks per rest group
+
+    // only the last unit of a row can be partial, it has its own code without branches in the full one
+    const auto load = [&](const int u, auto full_tag, unit_data & d) {
         constexpr bool full = decltype(full_tag)::value;
         const int kb0 = u*G;
         const int nb  = full ? G : min(G, nkb - kb0);
-        int4 v[G][NC];
-        int4 vg[G][has_gate ? NC : 1];
-        const int64_t pstride = (int64_t) nkb*r*16;
 #pragma unroll
         for (int b = 0; b < G; ++b) {
             if (full || b < nb) {
-                const int64_t o = ((int64_t) (kb0 + b)*r + row)*16;
+                const int o = ((kb0 + b)*r + row)*16;
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
-                    v[b][c] = *(const int4 *) (sx + o + c*pstride);
+                    d.v[b][c] = ggml_cuda_repack_buffer_load(rx, o, c*pstride);
                     if constexpr (has_gate) {
-                        vg[b][c] = *(const int4 *) (sg + o + c*pstride);
+                        d.vg[b][c] = ggml_cuda_repack_buffer_load(rg, o, c*pstride);
                     }
                 }
             }
         }
-        // rest bytes of each block: one 16 byte load for a whole group, else one load per block
-        int rw[G][2] = {};
-        int rg[G][2] = {};
+        // rest bytes of each block: one load for a full unit, else one load per block
         if constexpr (L.rest > 0) {
             static_assert(L.rest == 2 || L.rest == 8, "unsupported rest size");
             const int64_t ro = ggml_cuda_repack_rest_offset(L, kb0, row, r, nkb);
             const auto load_rest = [&](const char * p, int (*w)[2]) {
                 if (G > 1 && full) {
-                    static_assert(G == 1 || G*L.rest == 16, "rest group must be one chunk");
-                    const int4 t = *(const int4 *) (p + ro);
-                    const int tv[4] = {t.x, t.y, t.z, t.w};
+                    // a full unit is in a full rest group, so its rests are contiguous and aligned
+                    static_assert(G == 1 || G*L.rest == 8 || G*L.rest == 16, "rest of a unit must be 8 or 16 bytes");
+                    int tv[4];
+                    if constexpr (G*L.rest == 16) {
+                        const int4 t = *(const int4 *) (p + ro);
+                        tv[0] = t.x; tv[1] = t.y; tv[2] = t.z; tv[3] = t.w;
+                    } else {
+                        const int2 t = *(const int2 *) (p + ro);
+                        tv[0] = t.x; tv[1] = t.y;
+                    }
 #pragma unroll
                     for (int b = 0; b < G; ++b) {
                         if constexpr (L.rest == 2) {
@@ -380,32 +472,76 @@ static __global__ void mul_mat_vec_q_repack(const mmvq_repack_args a) {
                     }
                 }
             };
-            load_rest(sx, rw);
+            load_rest(sx, d.rw);
             if constexpr (has_gate) {
-                load_rest(sg, rg);
-            }
-        }
-#pragma unroll
-        for (int b = 0; b < G; ++b) {
-            if (full || b < nb) {
-                const block_q8_1 * yk[ncols];
-#pragma unroll
-                for (int j = 0; j < ncols; ++j) {
-                    yk[j] = y + j*a.stride_col_y + (kb0 + b)*(ggml_cuda_type_traits<type>::qk/QK8_1);
-                }
-                blk::dot(v[b], rw[b], yk, acc);
-                if constexpr (has_gate) {
-                    blk::dot(vg[b], rg[b], yk, accg);
-                }
+                load_rest(sg, d.rg);
             }
         }
     };
 
+    // y is the same for all lanes: scalar loads, one sub-block ahead of the math
+    const auto yfetch = [&](const int u, const int s, mmvq_repack_ysub<ncols> & yb) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const block_q8_1 * p = y + j*a.stride_col_y + NS*u + s;
+            const int * q = (const int *) p->qs;
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                yb.q[j][m] = q[m];
+            }
+            yb.d[j] = __half22float2(p->ds);
+        }
+    };
+
+    const auto math = [&](const int u, auto full_tag, const unit_data & d) {
+        constexpr bool full = decltype(full_tag)::value;
+        const int nb = full ? G : min(G, nkb - u*G);
+        typename blk::state st;
+        typename blk::state stg;
+        blk::init(d.v, d.rw, st);
+        if constexpr (has_gate) {
+            blk::init(d.vg, d.rg, stg);
+        }
+        // K-quants: y one sub-block ahead; Q4_0/Q8_0 (a sub-block is a whole block) need the SGPRs for more blocks
+        constexpr bool ahead = G == 1;
+        mmvq_repack_ysub<ncols> yc;
+        if constexpr (ahead) {
+            yfetch(u, 0, yc);
+        }
+#pragma unroll
+        for (int s = 0; s < NS; ++s) {
+            mmvq_repack_ysub<ncols> yn;
+            if (ahead && s < NS - 1) {
+                yfetch(u, s + 1, yn);
+            }
+            if (!ahead) {
+                yfetch(u, s, yc);
+            }
+            if (full || s < nb*bq) {
+                blk::sub(d.v, d.rw, s, yc, st, acc);
+                if constexpr (has_gate) {
+                    blk::sub(d.vg, d.rg, s, yc, stg, accg);
+                }
+            }
+            if (ahead && s < NS - 1) {
+                yc = yn;
+            }
+        }
+        blk::fin(st, acc);
+        if constexpr (has_gate) {
+            blk::fin(stg, accg);
+        }
+    };
+
     for (int u = u0; u < u1; ++u) {
-        if (G == 1 || (u + 1)*G <= nkb) {
-            unit(u, std::true_type{});
+        unit_data d;
+        // full unit: all its blocks exist and its rest group (16/rest blocks) is complete
+        if (G == 1 || ((u*G)/GR + 1)*GR <= nkb) {
+            load(u, std::true_type{}, d);
+            math(u, std::true_type{}, d);
         } else {
-            unit(u, std::false_type{});
+            load(u, std::false_type{}, d);
+            math(u, std::false_type{}, d);
         }
     }
 
@@ -585,16 +721,16 @@ void ggml_cuda_mul_mat_vec_q_repack(
     const int ncols  = ids ? 1 : ncols_dst;
     const int ntiles = nstripes*nchannels_dst*(ids ? ncols_dst : nsamples_dst);
 
-    // waves per block and blocks per stripe: 8 waves per block if K allows it, more blocks only for few stripes
+    // Waves per tile: 4 per block, 8 for fewer tiles than CUs (fewer than half of them for 3+ columns: 8-wave blocks
+    // with 3 waves per SIMD fit once per CU). If that gives less than 3/4 of 320 waves (960 for 3+ columns),
+    // the tiles are also split over K (kz blocks per tile), with at least 1024 values of K per block.
+    // (sweep of nw and kz on 1024-17408 rows, K = 2816-17408)
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
-    // (1024 x 5120 Q5_K: 16 stripes -> 5 blocks of 4 waves per stripe, 11.7 -> 7.2 us)
-    const int G  = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 ? 8 : 1;
+    const int G  = mmvq_repack_g(type, ncols);
     const int nu = (nkb + G - 1)/G; // loop steps
-    int kz = 1;
-    if (4*ntiles < nsm) {
-        kz = std::max<int>(1, std::min<int>(nu/4, (nsm + ntiles - 1)/ntiles));
-    }
-    int nw = MMVQ_REPACK_MAX_WARPS;
+    int nw = ntiles < (ncols >= 3 ? nsm/2 : nsm) ? 8 : 4;
+    const int target = (ncols <= 2 ? 2*nsm/3 : 2*nsm)*4;
+    const int kz = 4*ntiles*nw >= 3*target ? 1 : std::max<int>(1, std::min<int>(src0->ne[0]/1024, (target + ntiles*nw - 1)/(ntiles*nw)));
     while (nw > 1 && kz*nw > nu) {
         nw /= 2;
     }

@@ -1885,7 +1885,7 @@ static void ggml_cuda_mul_mat_repack(ggml_backend_cuda_context & ctx, const ggml
     const int cc   = ggml_cuda_info().devices[ctx.device].cc;
     const int64_t ne11 = src1->ne[1];
     // matrices with few rows have too few MMQ tiles, as in ggml_cuda_should_use_mmvq
-    const int mmvq_max = src0->ne[1] < 1024 ? GGML_CUDA_REPACK_MMVQ_MAX_COLS : ggml_cuda_repack_mmvq_max_cols(src0->type);
+    const int mmvq_max = ggml_cuda_repack_mmvq_max_cols(src0);
     if (ne11 <= mmvq_max) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;

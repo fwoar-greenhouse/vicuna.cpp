@@ -11847,7 +11847,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
         for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 16, 512}) {
-            for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}, {6144, 5120}, {1024, 5120}, {21504, 5376}, {5376, 21504}, {2816, 2112}, {4096, 2816}}) {
+            for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}, {6144, 5120}, {5120, 6144}, {10240, 5120}, {12288, 5120}, {1024, 5120}, {21504, 5376}, {5376, 21504}, {2816, 2112}, {2112, 2816}, {2048, 2816}, {4096, 2816}, {2816, 4096}}) {
                 if (mk[1] % ggml_blck_size(type) == 0) {
                     test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, mk[0], n, mk[1]));
                 }
