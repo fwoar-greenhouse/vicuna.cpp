@@ -47,6 +47,22 @@ Share of GPU kernel time by kernel family. "decode" = `-p 0 -n 32`, "batch 16" =
 - Qwen decode runs ~1,900 kernels per token. Small kernels take ~4.5 us each regardless of size, about 7.8 ms per token in total.
 - MMVQ alone reaches ~785 GB/s on Qwen decode (64% of peak). The rest of the gap to the 43% end-to-end figure is small-kernel time.
 
+### Kernel time profile at HEAD (2026-10-04, after the item 4/5 work)
+
+Same method, commit 9e510ec. "MMQ" includes `mul_mat_q_stream_k_fixup` (Qwen batch 16: 13% of kernel time, 31B: 7%, 26B-A4B: 6%).
+
+| profile | quantized matmul | rms_norm | quantize_q8_1 | flash attn | other notable | kernels per token (24f5984 -> now) |
+|---|---|---:|---:|---:|---|---:|
+| Qwen3.8-27B decode | MMVQ 76.4% | 5.5% | 4.1% | 1.6% | glu 2.8%, get_rows 2.0%, GDN 1.7% | 1,905 -> 1,709 |
+| Qwen3.8-27B batch 16 | MMQ 72.7% | 2.9% | 4.0% | 1.0% | GDN 6.1% | |
+| Gemma 4 31B decode | MMVQ 79.2% | 8.8% | 3.4% | 6.5% | cpy 1.6% | 1,450 -> 1,280 |
+| Gemma 4 31B batch 16 | MMQ 79.2% | 5.3% | 3.5% | 6.0% | | |
+| Gemma 4 26B-A4B decode | MMVQ 49.7% | 16.5% | 7.8% | 9.7% | top-k 3.3%, glu 2.6%, cpy 2.5%, router MMVF 2.4% | 1,285 -> 1,140 |
+| Gemma 4 26B-A4B batch 16 | MMQ 70.3% | 6.1% | 3.6% | 4.0% | router MMVF 3.0% (was MMF 15.1%), D2D copies 3.8% | |
+
+- Most small kernels still take 4.2-4.5 us in a HIP graph whatever they do, so the number of launches matters more than the work inside them.
+- One-block kernels (rms_norm of a single row) seem to pay for cold instruction cache misses: more code costs time even when it is not executed often (likely cause, not measured with counters). Unrolled epilogues (e.g. a q8_1 output in rms_norm) made the kernel 3-6 us slower in the graph, but not in a microbenchmark.
+
 ## Progress (2026-10-04): tag mi100-pruned-verified -> 2b2b4f8
 
 Interleaved llama-bench (2 rounds, `-ngl 99 -fa 1 -r 3`, f16 KV unless noted), Nix flake build vs pre-optimization libs:
@@ -60,6 +76,15 @@ Interleaved llama-bench (2 rounds, `-ngl 99 -fa 1 -r 3`, f16 KV unless noted), N
 
 Qwen3.8-27B, KV q8_0/q8_0 at 64k depth: tg64 18.0 -> 26.5 (+47%), pp16 134.8 -> 192.1 (+42%). FA compute buffer at 262k context: 1360 -> 505 MiB.
 
+Small kernels and MoE (items 4/5), 24f5984 -> 9e510ec, same method:
+
+| model | pp2 | pp4 | pp8 | pp16 | pp512 | tg128 |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.8-27B Q5_K_S | +1.5% | +0.7% | +0.6% | +0.4% | +0.4% | 31.0 -> 31.4 (+1.3%) |
+| Gemma 4 31B Q5_K_XL | +2.2% | +0.8% | +0.5% | +0.4% | +0.7% | 25.9 -> 26.3 (+1.9%) |
+| Gemma 4 26B-A4B Q5_K_XL | +7.3% | +32.1% | +17.5% | +13.7% | +1.5..6% | 96.9 -> 104.4 (+7.8%) |
+| Gemma 4 26B-A4B QAT Q4_K_XL | +7.1% | +36.0% | +20.2% | +16.0% | +1.8% | 116.1 -> 125.6 (+8.2%) |
+
 ## Priority: generic parity first
 
 Goal: bring the gfx908 backend to parity with the CUDA backend across model types before any model-specific tuning.
@@ -71,8 +96,8 @@ Every change is measured on the whole benchmark suite below, not on one model.
 3. [x] Flash attention for 1-16 query rows, all head sizes and GQA ratios (A1, A2): split-KV MFMA with 4x4x4 / 16x16x16 shapes, including D=512 (P4). Done for D = 64/128/256/512, see the status below.
 3a. [x] Quantized KV cache in the tile and MMA FA kernels (A14): dequantize K/V tiles while loading them into LDS instead of converting the whole cache to f16 first. Done for the MMA kernel; the tile kernel only gets quantized K/V for D % 64 != 0.
 3b. [ ] More KV cache types (A15): IQ4_NL and a rotation-aware 3-4 bit codebook type (TurboQuant-style), with FA readers.
-4. [ ] MoE MUL_MAT_ID without the host-synchronizing hipBLAS fallback (A3).
-5. [ ] Wave64-aware small kernels with DPP reductions (A11, P2).
+4. [x] MoE MUL_MAT_ID without the host-synchronizing hipBLAS fallback (A3). Done: always MMQ, see the status below.
+5. [ ] Wave64-aware small kernels with DPP reductions (A11, P2). Partly done (rms_norm, topk-moe, q8_1 reuse, rms_norm fusions), see the status below.
 6. [ ] Flash attention load pipelining (A5).
 7. [ ] Gated DeltaNet / linear-attention decode and verify kernel (P1, P3).
 8. [ ] Remaining gaps A7-A10, A13.
@@ -109,6 +134,26 @@ Remaining gaps:
 
 Design note for 3b (new KV types): both kernels convert in the load step only. A new type needs a raw load + unpack to 4-value groups (vector kernel: `ggml_cuda_fattn_vec_load_q`/`unpack_q`, the values become f16 by `v_perm` with 0x64 bytes) and a block loader for the MMA tiles (`flash_attn_ext_f16_load_tile_q`). A codebook type (Lloyd-Max levels for Hadamard-rotated K/V) would replace the `v_perm` + scale step with a 16-entry f16 lookup (per-lane table in registers or LDS), the rest of both kernels stays the same.
 
+### Items 4/5 status (2026-10-04)
+
+Done (each bit-identical to the code before, except where noted):
+- Small f32 matrices (MoE router, 2816x128) with 4-16 columns use MMVF (in chunks of 8 columns above 8) instead of MMF, which ran as 2 blocks: 100-200 us -> 11-33 us per call. 26B-A4B pp4 +26-30%, pp16 +12-14%.
+- `rms_norm_f32_vec`: wave64 rms_norm with float4 loads, the row and the weights in registers, 64/256 threads and the reduction of the old kernel mapped to DPP/ds_swizzle steps (same order, same bits). Covers rms_norm, +mul, +mul+add, +scale for ncols % 4 == 0 up to 8192. 5376 columns mul+add 11.7 -> 7.0 us.
+- MMVQ keeps the q8_1 copy of src1 during the graph evaluation (up to 4 entries, dropped when a node writes the src1 memory), so Q/K/V, gate/up and the GDN in_proj/z/alpha/beta matmuls quantize once. Decode quantize_q8_1 launches: Qwen 453 -> 257 per token, 26B-A4B 266 -> 181.
+- MUL_MAT_ID always uses MMQ (A3): no host sync and HIP graphs stay on for MoE models with <= 64 experts at > 128 tokens. MUL_MAT_ID 32 experts at 256-512 tokens 1.4-2.7x faster than the sorted hipBLAS path.
+- topk-moe: DPP/ds_swizzle shuffles, 13.2 -> 11.4 us per call.
+- Fusions rms_norm -> scale -> mul (router input) and rms_norm -> mul -> add -> mul by one value (layer output scale): -2 launches per 26B-A4B layer, -1 per 31B layer.
+
+Tried without gain:
+- rms_norm (+mul) and GLU writing the q8_1 copy for the next MMVQ directly (bit-identical to quantize_q8_1): removed 2-3 quantize launches per layer, but the one-block rms_norm got 3-6 us slower in the graph (cold I-cache, more code; LDS staging and a non-unrolled loop halved the cost but it stayed slower than norm + quantize). The GLU variant was neutral.
+- A 4-values-per-thread quantize_q8_1 (with DPP sums): same kernel time, not kept.
+- Stream-k fixup inside `mul_mat_q` (last block of a tile adds the partial sums, counters reset by the kernel): the separate fixup kernels went away, but `mul_mat_q` got slower by the same amount or more (microbenchmark 130 -> 147 us for Q5_K 17408x5120 at 16 columns). The fixup kernel is still 6-13% of batch-16 time and the next target for small batches.
+
+Remaining:
+- Launch count: decode still runs 1,140-1,710 kernels per token at ~4.3 us each. Candidates: the three rms_norms of the same input in Gemma 4 MoE layers (not adjacent in the graph, needs a memory-safety check for out-of-order writes), get_rows + moe_weighted_reduction + binbcast in the MoE output, set_rows/cpy pairs, the D2D copies in MoE batch 16 (3.8%).
+- The stream-k fixup kernel (above).
+- softmax, norm/l2_norm/group_norm and other kernels with 32-lane logical warps (A11).
+
 ### Benchmark suite
 
 All under `~/.cache/huggingface/hub/`, run with `HIP_VISIBLE_DEVICES=0 llama-bench -ngl 99 -fa 1 -p 2,4,8,16,512 -n 128`:
@@ -128,7 +173,7 @@ Each model also has an MTP draft GGUF (`mtp-*.gguf`) for speculative-decoding te
 |---|---|---|---|---|
 | A1 | FA decode and small batch (`fattn.cu:684-697`, `fattn-mma-f16.cuh:1880-1885`) | MMA kernel at ncols=8 for GQA decode | tile kernel (v_dot2) when ne1*gqa <= 16 at D=128 | Allow ncols 8 and 16 on CDNA: `v_mfma_f32_16x16x16f16` with GQA heads on N, or `v_mfma_f32_4x4x4f16` for ncols <= 4. Then re-tune the thresholds. |
 | A2 | FA for MLA and large heads 576/512, 512, 320 (`fattn.cu:184-185,694`, `fattn-mma-f16.cuh:1881`) | ncols2 16/32 variants per arch | tile kernel unless ne1*gqa > 128. CDNA configs for ncols 8/16 exist but are not compiled. | Enable ncols=16 for DKQ > 256. Keep nbatch_K2/V2 inside 64 KB LDS. |
-| A3 | MoE MUL_MAT_ID prompt processing (`mmq.cu:396-405`, `ggml-cuda.cu:1942-2003,2577-2585`) | always MMQ | sorted hipBLAS path with host syncs, which also disables HIP graphs | Always use MMQ for MUL_MAT_ID on CDNA1, then tune. |
+| A3 | MoE MUL_MAT_ID prompt processing (`mmq.cu:396-405`, `ggml-cuda.cu:1942-2003,2577-2585`) | always MMQ | sorted hipBLAS path with host syncs, which also disables HIP graphs | Always use MMQ for MUL_MAT_ID on CDNA1, then tune. Done 2026-10-04 (always MMQ). |
 | A4 | MMQ tile shapes (`mmq-config-cdna.cuh`, `mmq.cuh:181-185`, `mma.cuh:1401-1409`) | J up to 128, 256 threads, occupancy 2 | one config: 512 threads, J <= 64, 16x16 i8 tiles; dense ne11 > 128 goes to rocBLAS | J=96/128 configs with `v_mfma_i32_32x32x8i8`, then widen the `ggml_cuda_should_use_mmq` window. |
 | A5 | FA load pipelining (`fattn-mma-f16.cuh:377-442,504-525`) | multi-stage cp.async prefetch | nstages=0, so loads and MFMA run in series | Software double buffer (global -> VGPR -> LDS), or `buffer_load ... lds`. |
 | A6 | MMF dense f16/bf16 at batch 3-16 (`mmf.cu:174-175`, `mmvf.cu:847,865`) | MMF up to 16 columns | rocBLAS | Tune the MFMA MMF path (`16x16x16f16`, `16x16x8bf16`) and remove the CDNA1 exclusion. |
@@ -136,7 +181,7 @@ Each model also has an MTP draft GGUF (`mtp-*.gguf`) for speculative-decoding te
 | A8 | Mamba-2 SSD prefill (`ssm-scan.cu:361-781,840-848`) | chunked SSD with cuBLAS batched GEMM | sequential scan | Use hipBLAS strided-batched GEMM. |
 | A9 | Lightning indexer (`lightning-indexer.cu:450-511`) | nvcuda::wmma kernel | vector kernel that assumes 32 lanes | MFMA `16x16x16f16` port, wave64-aware. |
 | A10 | ARGSORT on large rows (`common.cuh:114-116`, `ggml-cuda.cu:5577-5586`) | CUB segmented sort | bitonic only; rows above 16384 columns fall back to CPU | hipCUB / rocPRIM segmented radix sort. |
-| A11 | 32-lane logical warps on wave64 (`softmax.cu:308,377`, `topk-moe.cu:91,115`) | full warps | half of each wave is idle | Template on `ggml_cuda_get_physical_warp_size()`. |
+| A11 | 32-lane logical warps on wave64 (`softmax.cu:308,377`, `topk-moe.cu:91,115`) | full warps | half of each wave is idle | Template on `ggml_cuda_get_physical_warp_size()`. rms_norm rewritten for wave64 and topk-moe shuffles moved to DPP (2026-10-04); softmax and the other norms remain. |
 | A12 | MMVQ/MMVF tuning (`mmvq.cu:105-145,468-598`) | per-arch tables | shares the GCN table | Sweep nwarps 4/8 at ncols=1 for CDNA1. |
 | A14 | Quantized KV in tile/MMA FA (`fattn.cu` need_f16_K/V, `fattn-common.cuh` f16 extra data) | same as gfx908 (converts to f16) | Prefill and verify convert the whole visible K and V to f16 in a scratch buffer (`nelements*2` bytes each; ~1 GiB at 262k ctx for Qwen3.8-27B) on every call | Dequantize K/V tiles to f16 in LDS inside the tile and MMA kernels. Saves the scratch memory and the conversion traffic. Beyond CUDA parity. |
 | A15 | KV cache types | same set | FA reads only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 in-kernel | Add IQ4_NL and a 3-4 bit Lloyd-Max codebook type for Hadamard-rotated K/V (llama.cpp already rotates quantized KV, `attn_rot_k/v`); optional QJL residual later. Needs a ggml type, CPU reference, SET_ROWS quantize kernel and FA readers. |
