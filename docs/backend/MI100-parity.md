@@ -98,8 +98,8 @@ Every change is measured on the whole benchmark suite below, not on one model.
 3b. [ ] More KV cache types (A15): IQ4_NL and a rotation-aware 3-4 bit codebook type (TurboQuant-style), with FA readers.
 4. [x] MoE MUL_MAT_ID without the host-synchronizing hipBLAS fallback (A3). Done: always MMQ, see the status below.
 5. [ ] Wave64-aware small kernels with DPP reductions (A11, P2). Partly done (rms_norm, topk-moe, q8_1 reuse, rms_norm fusions), see the status below.
-6. [ ] Flash attention load pipelining (A5).
-7. [ ] Gated DeltaNet / linear-attention decode and verify kernel (P1, P3).
+6. [ ] Flash attention load pipelining (A5). Tried for the MMA kernel, see the long-prefill status below: not enough registers with in-kernel dequantization.
+7. [ ] Gated DeltaNet / linear-attention decode and verify kernel (P1, P3). Prefill (>= 64 tokens) uses the chunked delta rule since 83089a4, see below.
 8. [ ] Remaining gaps A7-A10, A13.
 
 Model-specific tuning (for example Qwen3.8-27B verify shapes) comes after this list.
@@ -217,6 +217,54 @@ Remaining:
 - Launch count: decode still runs 1,140-1,710 kernels per token at ~4.3 us each. Candidates: the three rms_norms of the same input in Gemma 4 MoE layers (not adjacent in the graph, needs a memory-safety check for out-of-order writes), get_rows + moe_weighted_reduction + binbcast in the MoE output, set_rows/cpy pairs, the D2D copies in MoE batch 16 (3.8%).
 - The stream-k fixup kernel (above).
 - softmax, norm/l2_norm/group_norm and other kernels with 32-lane logical warps (A11).
+
+### Long-context prefill status (2026-10-05)
+
+Workload: Qwen3.8-27B UD-Q5_K_S, llama-server `-ub 1024 -b 2048`, KV q8_0/q4_0. A 75k-token request spent ~80% of its wall time in prefill.
+
+Kernel time profile, llama-bench `-p 2048 -d 32768 -ub 1024 -b 2048`, KV q8_0/q4_0 (rocprofv3 `--kernel-trace`; `--stats` crashes during model load with this build), 16e14ce -> 6c09cd7:
+
+| kernel family | before: share, ms/call | after: share, ms/call |
+|---|---|---|
+| hipBLAS GEMM | 48.3%, 1.53 | 62.1%, 1.54 |
+| gated_delta_net | 17.7%, 5.80 | 3.1%, 0.79 (prep 0.30 + scan 0.49) |
+| fattn-mma | 17.1%, 16.86 | 16.9%, 12.91 |
+| k_dequant_repack_f16 | 6.0%, 0.24 | 7.5%, 0.23 |
+| concat | 3.6%, 1.19 | 0.8%, 0.21 |
+| total kernel busy time | 56.7 s | 44.1 s |
+
+Done:
+- GATED_DELTA_NET (scalar gate, head size 64/128, >= 64 tokens): chunked delta rule with chunks of 64 tokens, all fp32 with `v_mfma_f32_16x16x4f32`. `gdn_chunk_prep` (all chunks in parallel) computes the cumulative gate, T = (I + A)^-1 by 16x16 blocks, W = T diag(beta exp(G)) K, U = T diag(beta) V and the masked Q K^T; `gdn_chunk_scan` walks the chunks with the state in registers, one block per head and group of 16-64 state columns, and loads the operands of the next chunk during the current one. Rollback snapshots (K > 1) and the fused cache write are supported. NMSE vs CPU <= 1e-9. KDA (vector gate) and smaller batches use the token-by-token kernel. Qwen3.8-27B shape, 1024 tokens: 5505 -> 752 us.
+- CONCAT with a transposed source (the conv state `concat(conv_states, transpose(x))` of Qwen3.5/3.8 and Mamba): 64x64 tiles through LDS, 628 -> 141 us.
+- FA MMA kernel: for a GQA ratio that is not a power of 2, ncols2 is the largest power of 2 that divides it (GQA 6: 2 instead of 8, no padded Q heads, 32 Q rows per block): +45% f16, +22% q8_0/q4_0 at nb=1024. An extra kernel instance for K/V in {q8_0, q4_0} without the generic dequantization code: +8% (D=256) and +15% (D=512) for these types.
+
+FA op time, test-backend-ops perf, nb=1024, kv=16384 (16e14ce -> 6c09cd7): D=256 GQA 6 f16 15.30 -> 10.66 ms (27 -> 39 TFLOP/s), q8_0/q4_0 15.20 -> 11.59 ms (27 -> 36 TFLOP/s); D=256 GQA 2 q8_0/q4_0 15.88 -> 14.74 ms (35 -> 37 TFLOP/s); D=512 GQA 8 q8_0/q4_0 49.15 -> 42.71 ms (22 -> 26 TFLOP/s); f16 unchanged for power-of-2 GQA.
+
+llama-bench, interleaved 2 rounds, 16e14ce -> 6c09cd7:
+
+| model, KV | test | before | after | |
+|---|---|---:|---:|---:|
+| Qwen3.8-27B, q8_0/q4_0, `-ub 1024 -b 2048` | pp2048 | 775.8 | 961.7 | +24.0% |
+| | pp2048 @ d16384 | 649.8 | 812.7 | +25.1% |
+| | pp2048 @ d49152 | 491.6 | 622.8 | +26.7% |
+| Gemma 4 31B, f16, `-ub 1024 -b 2048` | pp2048 / @ d16384 | 921.0 / 588.6 | 917.7 / 587.0 | -0.4% / -0.3% |
+| Qwen3.8-27B, f16, default | pp512 | 681.5 | 814.2 | +19.5% |
+
+pp2..pp16 and tg128 of all four models within -1.0..+1.5% (noise). llama-server (the production command above, port 8011), 58,593-token prompt: prefill 563 -> 710 t/s (104.0 -> 82.5 s), same output.
+KLD (Qwen3.8-27B, KV q8_0/q4_0, -c 4096, 5 chunks, ub 1024) vs before: 0.000333 (base ub 512 vs ub 1024: 0.000318). The FA changes are bit-identical.
+
+Tried without gain:
+- FA MMA kernel, register prefetch of the next K tile during VKQ and of the V tile during KQ (A5): f16 +2..5%, but with in-kernel dequantization the kernel (128 VGPR + 128 AGPR at 2 waves/SIMD) spills inside the KV loop and q8_0/q4_0 got 60% slower; V-only prefetch still 14% slower. Not kept.
+- FA MMA D=256 with 256 threads (1 wave/SIMD, no spills) or with 2 blocks of 4 waves per CU and nbatch_fa=32: 20-35% slower; the kernel needs 2 waves/SIMD of the same block to hide LDS and global latency.
+- FA D=512 with nbatch_fa=32 and the whole row per K/V load (half the barriers): +-2%.
+- Skipping the VKQ rescale when no KQ max changed (wave vote): +8% for quantized K/V, -4% for f16 (register allocation), not kept.
+
+Remaining gaps (FA is now ~17% of long prefill, at ~36 of ~185 TFLOP/s):
+- Per KV step of 64 rows the D=256 kernel issues per wave 64 MFMAs but ~830 other instructions: 128 `ds_read_u16` + 64 `v_perm` for the V^T operand, ~180 AGPR moves, 4 barriers with synchronous global loads. A V tile stored transposed in LDS (V^T rows contiguous in KV) would turn the V^T reads into `ds_read_b64`.
+- Load pipelining needs a register budget that the current kernel does not have: e.g. Q in LDS, a smaller VKQ tile per wave or a kernel built for CDNA (32x32 MFMA for VKQ, P in registers). This is a new kernel, not a tuning step.
+- Causal-mask tile skipping matters only at small depth (< 2% of the tiles at 16k).
+- gdn_chunk_scan is latency bound (1 block of 4 waves per CU, ~24 us per chunk vs ~9 us of MFMA work); gdn_chunk_prep is latency bound in its K K^T phase.
+- Decision for the user: K/V conversion to f16 per call for large batches would make q8_0/q4_0 as fast as f16 (10.7 vs 11.6 ms at 16k) but brings back the f16 copy of the whole visible K/V in the compute buffer (~850 MiB at 262k context).
 
 ### Benchmark suite
 
