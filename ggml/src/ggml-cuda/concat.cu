@@ -341,3 +341,97 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 }
+
+// CONCAT(state, x) along dim 0 with few columns + CPY of column windows of the result, one thread per row.
+// This is the conv state update of the gated delta net (state = last conv inputs, x = new tokens).
+static __global__ void concat_cpy_f32(
+        const float * __restrict__ state, const int ne_st, const int st_nb1, const int st_nb2,
+        const float * __restrict__ x, const int n_x, const int x_nb0, const int x_nb1, const int x_nb2,
+        float * __restrict__ cat, const int cat_nb1, const int cat_nb2,
+        const concat_cpy_args cpy, const int nr) {
+    const int r = blockIdx.y*blockDim.x + threadIdx.x;
+    const int s = blockIdx.x;
+    if (r >= nr) {
+        return;
+    }
+
+    state += s*st_nb2  + r*st_nb1;
+    x     += s*x_nb2   + r*x_nb1;
+    cat   += s*cat_nb2 + r*cat_nb1;
+
+    for (int j = 0; j < ne_st; ++j) {
+        cat[j] = state[j];
+    }
+    for (int t = 0; t < n_x; ++t) {
+        cat[ne_st + t] = x[t*x_nb0];
+    }
+
+    for (int i = 0; i < cpy.n; ++i) {
+        float * d = cpy.dst[i] + s*cpy.nb1[i] + r*cpy.ne0;
+        for (int k = 0; k < cpy.ne0; ++k) {
+            const int j = cpy.off[i] + k;
+            d[k] = j < ne_st ? state[j] : x[(j - ne_st)*x_nb0];
+        }
+    }
+}
+
+bool ggml_cuda_concat_cpy_supported(const ggml_tensor * cat, const ggml_tensor * const * cpys, int n_cpy) {
+    const ggml_tensor * st = cat->src[0];
+    const ggml_tensor * x  = cat->src[1];
+
+    if (ggml_get_op_params_i32(cat, 0) != 0 || n_cpy < 1 || n_cpy > CONCAT_CPY_MAX) {
+        return false;
+    }
+    if (cat->type != GGML_TYPE_F32 || st->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // few columns: the rows are written by one thread each
+    if (cat->ne[0] > 40 || cat->ne[3] != 1 || !ggml_is_contiguous(cat) || st->nb[0] != sizeof(float) ||
+        st->nb[1] % sizeof(float) || st->nb[2] % sizeof(float) ||
+        x->nb[0] % sizeof(float) || x->nb[1] % sizeof(float) || x->nb[2] % sizeof(float)) {
+        return false;
+    }
+    const int64_t nr   = cat->ne[1];
+    const int64_t n_s  = cat->ne[2];
+    const int64_t ne0  = cpys[0]->src[0]->ne[0];
+    for (int i = 0; i < n_cpy; ++i) {
+        const ggml_tensor * c   = cpys[i];
+        const ggml_tensor * src = c->src[0];
+        if (src->view_src != cat || src->ne[0] != ne0 || src->ne[1] != nr || src->ne[2] != n_s || src->ne[3] != 1 ||
+            src->nb[0] != sizeof(float) || src->nb[1] != cat->nb[1] || src->nb[2] != cat->nb[2] ||
+            src->view_offs % sizeof(float) || src->view_offs/sizeof(float) + ne0 > (size_t) cat->ne[0]) {
+            return false;
+        }
+        if (c->type != GGML_TYPE_F32 || c->nb[0] != sizeof(float) || c->ne[0] != ne0*nr || c->ne[1] != n_s ||
+            c->ne[2] != 1 || c->ne[3] != 1 || c->nb[1] % sizeof(float)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_op_concat_cpy(ggml_backend_cuda_context & ctx, ggml_tensor * cat, ggml_tensor * const * cpys, int n_cpy) {
+    const ggml_tensor * st = cat->src[0];
+    const ggml_tensor * x  = cat->src[1];
+
+    const int nr  = cat->ne[1];
+    const int n_s = cat->ne[2];
+    const int fs  = sizeof(float);
+
+    concat_cpy_args args = {};
+    args.n   = n_cpy;
+    args.ne0 = cpys[0]->src[0]->ne[0];
+    for (int i = 0; i < n_cpy; ++i) {
+        args.dst[i] = (float *) cpys[i]->data;
+        args.off[i] = cpys[i]->src[0]->view_offs / fs;
+        args.nb1[i] = cpys[i]->nb[1] / fs;
+    }
+
+    const int threads = 128;
+    const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
+    concat_cpy_f32<<<blocks, threads, 0, ctx.stream()>>>(
+        (const float *) st->data, st->ne[0], st->nb[1]/fs, st->nb[2]/fs,
+        (const float *) x->data, x->ne[0], x->nb[0]/fs, x->nb[1]/fs, x->nb[2]/fs,
+        (float *) cat->data, cat->nb[1]/fs, cat->nb[2]/fs,
+        args, nr);
+}

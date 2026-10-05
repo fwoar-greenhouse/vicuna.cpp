@@ -4590,6 +4590,71 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// CONCAT(conv state, x^T) + CPY of state windows into a cache, then SSM_CONV (+ SILU), as in the gated delta net
+// conv state update (CONCAT + CPY are fused in the CUDA backend)
+struct test_concat_cpy_ssm_conv : public test_case {
+    const int64_t d_conv;
+    const int64_t nr;
+    const int64_t n_t;
+    const int64_t n_s;
+    const int     n_cpy;
+    const bool    silu;
+
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_CPY_SSM_CONV";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(d_conv, nr, n_t, n_s, n_cpy, silu);
+    }
+
+    test_concat_cpy_ssm_conv(int64_t d_conv = 4, int64_t nr = 256, int64_t n_t = 4, int64_t n_s = 1, int n_cpy = 4, bool silu = true)
+        : d_conv(d_conv), nr(nr), n_t(n_t), n_s(n_s), n_cpy(n_cpy), silu(silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        outs.clear();
+
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, nr, n_s);
+        ggml_set_name(state, "state");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, n_s);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
+        ggml_set_name(w, "w");
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1) * nr, n_s * std::max(n_cpy, 1) + 1);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * cat = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_set_name(cat, "cat");
+        outs.push_back(cat);
+
+        // windows ending at the last n_cpy tokens, like build_conv_state with rollback slots
+        for (int t = 1; t <= n_cpy; ++t) {
+            const int64_t s_idx = std::max<int64_t>(0, cat->ne[0] - (d_conv - 1) - n_cpy + t);
+            ggml_tensor * src = ggml_view_3d(ctx, cat, d_conv - 1, nr, n_s, cat->nb[1], cat->nb[2], ggml_row_size(cat->type, s_idx));
+            ggml_tensor * dst = ggml_view_2d(ctx, cache, (d_conv - 1) * nr, n_s, cache->nb[1], (n_cpy - t) * n_s * cache->nb[1]);
+            ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, cpy);
+            }
+            outs.push_back(cpy);
+        }
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, cat, w);
+        if (silu) {
+            out = ggml_silu(ctx, out);
+        }
+        ggml_set_name(out, "out");
+        outs.push_back(out);
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -10452,6 +10517,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // concat + conv state copies (fused in CUDA for few tokens) + ssm_conv (+ silu)
+    for (int64_t n_t : {1, 4, 9}) {
+        for (int n_cpy : {0, 1, 4}) {
+            test_cases.emplace_back(new test_concat_cpy_ssm_conv(4, 1024, n_t, 1, n_cpy, true));
+        }
+    }
+    test_cases.emplace_back(new test_concat_cpy_ssm_conv(4, 384, 4, 3, 4, true));
+    test_cases.emplace_back(new test_concat_cpy_ssm_conv(4, 256, 2, 2, 2, false));
+    test_cases.emplace_back(new test_concat_cpy_ssm_conv(3, 256, 4, 1, 2, true));
+    test_cases.emplace_back(new test_concat_cpy_ssm_conv(4, 256, 40, 1, 4, true)); // too many columns, not fused
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)

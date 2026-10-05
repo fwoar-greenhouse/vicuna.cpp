@@ -3619,6 +3619,55 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// CONCAT at node i, then only views and CPYs of windows of the concat: one kernel writes all of them.
+// Returns the number of nodes to skip.
+static int ggml_cuda_try_concat_cpy_fusion(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * cat = cgraph->nodes[i];
+    ggml_tensor * cpys[CONCAT_CPY_MAX];
+    int n_cpy = 0;
+    int last  = i;
+
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || n->src[0]->view_src != cat || n_cpy == CONCAT_CPY_MAX ||
+            (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            break;
+        }
+        cpys[n_cpy++] = n;
+        last = j;
+    }
+    if (n_cpy == 0 || !ggml_cuda_concat_cpy_supported(cat, cpys, n_cpy)) {
+        return 0;
+    }
+
+    // the outputs must not overlap the inputs or each other
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    const ggml_tensor * outs[CONCAT_CPY_MAX + 1] = { cat };
+    for (int k = 0; k < n_cpy; ++k) {
+        outs[1 + k] = cpys[k];
+    }
+    for (int a = 0; a < n_cpy + 1; ++a) {
+        if (overlap(outs[a], cat->src[0]) || overlap(outs[a], cat->src[1])) {
+            return 0;
+        }
+        for (int b = a + 1; b < n_cpy + 1; ++b) {
+            if (overlap(outs[a], outs[b])) {
+                return 0;
+            }
+        }
+    }
+
+    ggml_cuda_op_concat_cpy(ctx, cat, cpys, n_cpy);
+    return last - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3651,6 +3700,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // concat -> cpy of windows of it: the conv state update of the gated delta net
+    if (node->op == GGML_OP_CONCAT) {
+        const int nodes_to_skip = ggml_cuda_try_concat_cpy_fusion(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
     }
