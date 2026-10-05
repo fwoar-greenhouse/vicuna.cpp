@@ -12176,6 +12176,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // few rows (e.g. the gated delta net alpha/beta projections)
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int bs : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  48, bs, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 192, bs, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
     // small batch at 26B-A4B MoE shapes: experts, then dense attention and shared ffn
     for (int bs : {1, 2, 3, 4, 5, 6, 7, 8, 12, 16}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
