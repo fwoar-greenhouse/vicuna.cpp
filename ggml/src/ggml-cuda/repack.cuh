@@ -20,6 +20,9 @@ struct ggml_cuda_repack_layout {
 
 static constexpr __host__ __device__ ggml_cuda_repack_layout ggml_cuda_repack_get_layout(const ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_0: return { 18,  1, 2,   0};
+        case GGML_TYPE_Q8_0: return { 34,  2, 2,   0};
+        case GGML_TYPE_Q4_K: return {144,  9, 0,   0};
         case GGML_TYPE_Q5_K: return {176, 11, 0,   0};
         case GGML_TYPE_Q6_K: return {210, 13, 2, 208};
         default:             return {  0,  0, 0,   0};
@@ -67,6 +70,9 @@ bool ggml_cuda_repack_supports_op(const ggml_tensor * op);
 // MUL_MAT uses the repacked GEMV up to this many columns, MMQ above (MUL_MAT_ID: up to 8 tokens).
 static int ggml_cuda_repack_mmvq_max_cols(const ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_0: return 6;
+        case GGML_TYPE_Q8_0: return 6;
+        case GGML_TYPE_Q4_K: return 5;
         case GGML_TYPE_Q5_K: return 4;
         case GGML_TYPE_Q6_K: return 6;
         default:             return GGML_CUDA_REPACK_MMVQ_MAX_COLS;

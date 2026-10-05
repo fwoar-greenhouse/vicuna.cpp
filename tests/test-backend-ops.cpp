@@ -10445,7 +10445,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
     // weights in the extra buffer type of the device (MI100 repack, GGML_HIP_REPACK=1), skipped if there is none
-    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33, 200}) {
             test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 64,   n, 256));
             test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 165,  n, 2816));
@@ -10464,6 +10464,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 1000, 5,   5120));
         test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 70,   300, 256));
+    }
+    // Q4_0/Q8_0 with K % 256 != 0: the last group of 8 blocks is partial (MoE down projections, K = 704)
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 3, 8, 16, 100}) {
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 130, n, 704));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 64,  n, 704, 8, 2));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 70,  n, 96));
+        }
+        test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 77, 9, 704));
     }
 
 #if 0
@@ -11571,7 +11580,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // fusions with the weights in the extra buffer type of the device (MI100 repack)
-    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             for (bool with_bias : {false, true}) {
                 for (bool with_gate : {false, true}) {
@@ -11734,12 +11743,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 16, 512}) {
-            for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}, {6144, 5120}, {1024, 5120}, {21504, 5376}, {5376, 21504}}) {
-                test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, mk[0], n, mk[1]));
+            for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}, {6144, 5120}, {1024, 5120}, {21504, 5376}, {5376, 21504}, {2816, 2112}, {4096, 2816}}) {
+                if (mk[1] % ggml_blck_size(type) == 0) {
+                    test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, mk[0], n, mk[1]));
+                }
             }
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 704, n, 2816, 128, 8));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 1408, n, 2816, 128, 8));
+            if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) {
+                test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 2816, n, 704, 128, 8));
+            }
         }
     }
 

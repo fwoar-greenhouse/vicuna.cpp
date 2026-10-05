@@ -2,6 +2,7 @@
 #include "unary.cuh"
 
 #include <algorithm>
+#include <type_traits>
 
 // GEMV on repacked weights (MMVQ-R): one lane = one row, a wave = one stripe of 64 rows,
 // the waves of a block split K. Each lane loads the chunks of its own block (1 KB contiguous per wave
@@ -41,10 +42,102 @@ struct mmvq_repack_args {
 template <ggml_type type, int ncols>
 struct mmvq_repack_block;
 
+// For the K-quants a loop step is one block (G = 1). For Q4_0/Q8_0 it is a group of G = 8 blocks,
+// whose d values are one 16 byte rest chunk.
+
+// Q4_K chunks: 0 = d, dmin, scales; 1-8 = qs.
+template <int ncols>
+struct mmvq_repack_block<GGML_TYPE_Q4_K, ncols> {
+    static constexpr int nchunk = 9;
+    static constexpr int G      = 1;
+
+    static __device__ __forceinline__ void dot(const int4 * v, const float, const block_q8_1 * const * y, float * acc) {
+        const int * q = (const int *) v;
+        const float2 dm = __half22float2(*(const half2 *) &q[0]);
+        const int scs[2] = {q[1] & 0x3f3f3f3f, (q[3] & 0x0f0f0f0f) | ((q[1] >> 2) & 0x30303030)};
+        const int ms[2]  = {q[2] & 0x3f3f3f3f, ((q[3] >> 4) & 0x0f0f0f0f) | ((q[2] >> 2) & 0x30303030)};
+        const int * qs = q + 4;
+        float sumd[ncols] = {0.0f};
+        float summ[ncols] = {0.0f};
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            int vv[8];
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                vv[m] = (qs[(s >> 1)*8 + m] >> (4*(s & 1))) & 0x0f0f0f0f;
+            }
+            const int scv = (scs[s >> 2] >> (8*(s & 3))) & 0xff;
+            const int mv  = (ms[s >> 2]  >> (8*(s & 3))) & 0xff;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                const block_q8_1 * yb = y[j] + s;
+                const int * yq = (const int *) yb->qs;
+                int dot = 0;
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    dot = ggml_cuda_dp4a(vv[m], yq[m], dot);
+                }
+                const float2 ds = __half22float2(yb->ds);
+                sumd[j] += ds.x * (float) (dot*scv);
+                summ[j] += ds.y * (float) mv;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            acc[j] += dm.x*sumd[j] - dm.y*summ[j];
+        }
+    }
+};
+
+// Q8_0: chunks 0-1 = qs, rest = d.
+template <int ncols>
+struct mmvq_repack_block<GGML_TYPE_Q8_0, ncols> {
+    static constexpr int nchunk = 2;
+    static constexpr int G      = 8;
+
+    static __device__ __forceinline__ void dot(const int4 * v, const float d, const block_q8_1 * const * y, float * acc) {
+        const int * q = (const int *) v;
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const int * yq = (const int *) y[j]->qs;
+            int dot = 0;
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                dot = ggml_cuda_dp4a(q[m], yq[m], dot);
+            }
+            acc[j] += d * __low2float(y[j]->ds) * (float) dot;
+        }
+    }
+};
+
+// Q4_0: chunk 0 = qs, rest = d.
+template <int ncols>
+struct mmvq_repack_block<GGML_TYPE_Q4_0, ncols> {
+    static constexpr int nchunk = 1;
+    static constexpr int G      = 8;
+
+    static __device__ __forceinline__ void dot(const int4 * v, const float d, const block_q8_1 * const * y, float * acc) {
+        const int * q = (const int *) v;
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const int * yq = (const int *) y[j]->qs;
+            int dot = 0;
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                dot = ggml_cuda_dp4a((q[m] >> 0) & 0x0f0f0f0f, yq[m + 0], dot);
+                dot = ggml_cuda_dp4a((q[m] >> 4) & 0x0f0f0f0f, yq[m + 4], dot);
+            }
+            const float2 ds = __half22float2(y[j]->ds);
+            acc[j] += d * (ds.x*dot - 8.0f*ds.y);
+        }
+    }
+};
+
 // Q5_K chunks: 0 = d, dmin, scales; 1-2 = qh; 3-10 = qs.
 template <int ncols>
 struct mmvq_repack_block<GGML_TYPE_Q5_K, ncols> {
     static constexpr int nchunk = 11;
+    static constexpr int G      = 1;
 
     static __device__ __forceinline__ void dot(const int4 * v, const float, const block_q8_1 * const * y, float * acc) {
         const int * q = (const int *) v;
@@ -89,6 +182,7 @@ struct mmvq_repack_block<GGML_TYPE_Q5_K, ncols> {
 template <int ncols>
 struct mmvq_repack_block<GGML_TYPE_Q6_K, ncols> {
     static constexpr int nchunk = 13;
+    static constexpr int G      = 1;
 
     static __device__ __forceinline__ void dot(const int4 * v, const float d, const block_q8_1 * const * y, float * acc) {
         const int * q = (const int *) v;
@@ -176,43 +270,99 @@ static __global__ void mul_mat_vec_q_repack(const mmvq_repack_args a) {
     const char * sg = has_gate ? a.gate + xoff : nullptr;
     const block_q8_1 * y = a.y + sample_dst*a.stride_sample_y + channel_y*a.stride_channel_y + col_dst*a.stride_col_y;
 
+    constexpr int G = blk::G;
+    const int nu  = (nkb + G - 1) / G; // loop steps of G blocks
     const int wg  = kzi*nw + w;
     const int nwg = a.kz*nw;
-    const int kb0 = (wg*nkb) / nwg;
-    const int kb1 = ((wg + 1)*nkb) / nwg;
+    const int u0  = (wg*nu) / nwg;
+    const int u1  = ((wg + 1)*nu) / nwg;
 
     float acc[ncols]  = {0.0f};
     float accg[ncols] = {0.0f};
 
-    for (int kb = kb0; kb < kb1; ++kb) {
-        int4 v[NC];
-        int4 vg[has_gate ? NC : 1];
-        const int64_t o = ((int64_t) kb*r + row)*16;
+    // a unit of G blocks; only the last unit of a row can be partial, it has its own code without branches in the full one
+    const auto unit = [&](const int u, auto full_tag) {
+        constexpr bool full = decltype(full_tag)::value;
+        const int kb0 = u*G;
+        const int nb  = full ? G : min(G, nkb - kb0);
+        int4 v[G][NC];
+        int4 vg[G][has_gate ? NC : 1];
         const int64_t pstride = (int64_t) nkb*r*16;
 #pragma unroll
-        for (int c = 0; c < NC; ++c) {
-            v[c] = *(const int4 *) (sx + o + c*pstride);
-            if constexpr (has_gate) {
-                vg[c] = *(const int4 *) (sg + o + c*pstride);
-            }
-        }
-        float d  = 0.0f;
-        float dg = 0.0f;
-        if constexpr (L.rest > 0) {
-            const int64_t ro = ggml_cuda_repack_rest_offset(L, kb, row, r, nkb);
-            d = __half2float(*(const half *) (sx + ro));
-            if constexpr (has_gate) {
-                dg = __half2float(*(const half *) (sg + ro));
-            }
-        }
-        const block_q8_1 * yk[ncols];
+        for (int b = 0; b < G; ++b) {
+            if (full || b < nb) {
+                const int64_t o = ((int64_t) (kb0 + b)*r + row)*16;
 #pragma unroll
-        for (int j = 0; j < ncols; ++j) {
-            yk[j] = y + j*a.stride_col_y + kb*(ggml_cuda_type_traits<type>::qk/QK8_1);
+                for (int c = 0; c < NC; ++c) {
+                    v[b][c] = *(const int4 *) (sx + o + c*pstride);
+                    if constexpr (has_gate) {
+                        vg[b][c] = *(const int4 *) (sg + o + c*pstride);
+                    }
+                }
+            }
         }
-        blk::dot(v, d, yk, acc);
-        if constexpr (has_gate) {
-            blk::dot(vg, dg, yk, accg);
+        float d[G];
+        float dg[G];
+        if constexpr (L.rest == 0) {
+#pragma unroll
+            for (int b = 0; b < G; ++b) {
+                d[b]  = 0.0f;
+                dg[b] = 0.0f;
+            }
+        } else if constexpr (G == 1) {
+            const int64_t ro = ggml_cuda_repack_rest_offset(L, kb0, row, r, nkb);
+            d[0] = __half2float(*(const half *) (sx + ro));
+            if constexpr (has_gate) {
+                dg[0] = __half2float(*(const half *) (sg + ro));
+            }
+        } else {
+            static_assert(G*L.rest == 16, "rest group must be one chunk");
+            const int64_t ro = ggml_cuda_repack_rest_offset(L, kb0, row, r, nkb);
+            half hd[G];
+            half hg[G];
+            if (full) {
+                *(int4 *) hd = *(const int4 *) (sx + ro);
+                if constexpr (has_gate) {
+                    *(int4 *) hg = *(const int4 *) (sg + ro);
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < G; ++b) {
+                    if (b < nb) {
+                        hd[b] = *(const half *) (sx + ro + 2*b);
+                        if constexpr (has_gate) {
+                            hg[b] = *(const half *) (sg + ro + 2*b);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < G; ++b) {
+                d[b]  = __half2float(hd[b]);
+                dg[b] = has_gate ? __half2float(hg[b]) : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < G; ++b) {
+            if (full || b < nb) {
+                const block_q8_1 * yk[ncols];
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    yk[j] = y + j*a.stride_col_y + (kb0 + b)*(ggml_cuda_type_traits<type>::qk/QK8_1);
+                }
+                blk::dot(v[b], d[b], yk, acc);
+                if constexpr (has_gate) {
+                    blk::dot(vg[b], dg[b], yk, accg);
+                }
+            }
+        }
+    };
+
+    for (int u = u0; u < u1; ++u) {
+        if (G == 1 || (u + 1)*G <= nkb) {
+            unit(u, std::true_type{});
+        } else {
+            unit(u, std::false_type{});
         }
     }
 
@@ -327,11 +477,14 @@ static __global__ void mul_mat_vec_q_repack(const mmvq_repack_args a) {
 template <ggml_type type, int ncols>
 static void mul_mat_vec_q_repack_launch(const mmvq_repack_args & a, const dim3 grid, const int nw, cudaStream_t stream) {
     const dim3 block(64, nw);
-    if (a.gate) {
-        mul_mat_vec_q_repack<type, ncols, true><<<grid, block, 0, stream>>>(a);
-    } else {
-        mul_mat_vec_q_repack<type, ncols, false><<<grid, block, 0, stream>>>(a);
+    if constexpr (ncols == 1) {
+        if (a.gate) {
+            mul_mat_vec_q_repack<type, ncols, true><<<grid, block, 0, stream>>>(a);
+            return;
+        }
     }
+    GGML_ASSERT(!a.gate && "gate fusion only for one column");
+    mul_mat_vec_q_repack<type, ncols, false><<<grid, block, 0, stream>>>(a);
 }
 
 template <ggml_type type>
@@ -389,15 +542,16 @@ void ggml_cuda_mul_mat_vec_q_repack(
     const int ncols  = ids ? 1 : ncols_dst;
     const int ntiles = nstripes*nchannels_dst*(ids ? ncols_dst : nsamples_dst);
 
-    // waves per block and blocks per stripe: enough blocks for the CUs, at least one block of K per wave
+    // waves per block and blocks per stripe: 8 waves per block if K allows it, more blocks only for few stripes
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     // (1024 x 5120 Q5_K: 16 stripes -> 5 blocks of 4 waves per stripe, 11.7 -> 7.2 us)
+    const int nu = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 ? (nkb + 7)/8 : nkb; // loop steps
     int kz = 1;
-    if (2*ntiles < nsm) {
-        kz = std::max<int>(1, std::min<int>(nkb/4, (nsm + ntiles - 1)/ntiles));
+    if (4*ntiles < nsm) {
+        kz = std::max<int>(1, std::min<int>(nu/4, (nsm + ntiles - 1)/ntiles));
     }
     int nw = MMVQ_REPACK_MAX_WARPS;
-    while (nw > 1 && kz*nw > nkb) {
+    while (nw > 1 && kz*nw > nu) {
         nw /= 2;
     }
     a.kz = kz;
@@ -411,6 +565,9 @@ void ggml_cuda_mul_mat_vec_q_repack(
     const dim3 grid(nstripes*kz, nchannels_dst, ids ? ncols_dst : nsamples_dst);
 
     switch (type) {
+        case GGML_TYPE_Q4_0: mul_mat_vec_q_repack_switch_ncols<GGML_TYPE_Q4_0>(a, ncols, grid, nw, stream); break;
+        case GGML_TYPE_Q8_0: mul_mat_vec_q_repack_switch_ncols<GGML_TYPE_Q8_0>(a, ncols, grid, nw, stream); break;
+        case GGML_TYPE_Q4_K: mul_mat_vec_q_repack_switch_ncols<GGML_TYPE_Q4_K>(a, ncols, grid, nw, stream); break;
         case GGML_TYPE_Q5_K: mul_mat_vec_q_repack_switch_ncols<GGML_TYPE_Q5_K>(a, ncols, grid, nw, stream); break;
         case GGML_TYPE_Q6_K: mul_mat_vec_q_repack_switch_ncols<GGML_TYPE_Q6_K>(a, ncols, grid, nw, stream); break;
         default: GGML_ABORT("unsupported repack type %s", ggml_type_name(type));

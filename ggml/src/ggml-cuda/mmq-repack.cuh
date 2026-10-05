@@ -61,7 +61,89 @@ template <ggml_type type, int J, bool fallback, bool store> static __device__ __
 
         int * x_qs = (int *) x_tile;
 
-        if constexpr (type == GGML_TYPE_Q5_K) {
+        if constexpr (type == GGML_TYPE_Q4_K) {
+            // part p: sub-blocks 2p and 2p+1, their d*sc and -dmin*m
+            half2 * x_dm = (half2 *) (x_qs + MMQ_TILE_NE_K*2);
+            const int p = part;
+
+            const int4 m  = mmq_ld4<store>(xr, ir, chunk(0));
+            const int4 q0 = mmq_ld4<store>(xr, ir, chunk(1 + 2*p));
+            const int4 q1 = mmq_ld4<store>(xr, ir, chunk(2 + 2*p));
+
+            if constexpr (store) {
+                const int qs[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+                int v[16];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    v[k + 0] = (qs[k] >> 0) & 0x0F0F0F0F;
+                    v[k + 8] = (qs[k] >> 4) & 0x0F0F0F0F;
+                }
+                int4 * dst = (int4 *) (x_qs + i*sram_stride + 16*p);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    dst[k] = make_int4(v[4*k + 0], v[4*k + 1], v[4*k + 2], v[4*k + 3]);
+                }
+
+                const int scales[3] = {m.y, m.z, m.w};
+                const half2 dm = (*(const half2 *) &m.x) * make_half2(1.0f, -1.0f);
+                const int sc32 = unpack_scales_q45_K(scales, (2*p)/4 + 0);
+                const int  m32 = unpack_scales_q45_K(scales, (2*p)/4 + 2);
+                const uint8_t * sc8 = (const uint8_t *) &sc32;
+                const uint8_t *  m8 = (const uint8_t *)  &m32;
+#pragma unroll
+                for (int l = 0; l < 2; ++l) {
+                    const int s = 2*p + l;
+                    x_dm[i*sram_stride + s] = dm*make_half2(sc8[s % 4], m8[s % 4]);
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) {
+            // the tile is 8 blocks = one rest group; part p: blocks 2p and 2p+1.
+            // Blocks past the end of the row (K % 256 != 0) load the last block again, their y values are 0.
+            float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+            const int p  = part;
+            int4 q[2][L.nchunk];
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+                const int kbb = min(kb + 2*p + b, nkb - 1);
+#pragma unroll
+                for (int c = 0; c < L.nchunk; ++c) {
+                    q[b][c] = mmq_ld4<store>(xr, ir, sx + ggml_cuda_repack_chunk_offset(c, kbb, row, r, nkb));
+                }
+            }
+            // the rest group of kb holds min(8, nkb - kb) d values
+            const int ng = min(8, nkb - kb);
+            const char * rp = sx + ggml_cuda_repack_rest_offset(L, kb, row, r, nkb);
+            half d[2];
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+                const int j = min(2*p + b, ng - 1);
+                d[b] = MMQ_LD(*(const half *) (rp + 2*j));
+            }
+
+            if constexpr (store) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+                    const int * qv = (const int *) q[b];
+                    int v[8];
+                    if constexpr (type == GGML_TYPE_Q8_0) {
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) {
+                            v[k] = qv[k];
+                        }
+                    } else {
+#pragma unroll
+                        for (int k = 0; k < 4; ++k) {
+                            v[k + 0] = __vsub4((qv[k] >> 0) & 0x0F0F0F0F, 0x08080808);
+                            v[k + 4] = __vsub4((qv[k] >> 4) & 0x0F0F0F0F, 0x08080808);
+                        }
+                    }
+                    int4 * dst = (int4 *) (x_qs + i*sram_stride + 8*(2*p + b));
+                    dst[0] = make_int4(v[0], v[1], v[2], v[3]);
+                    dst[1] = make_int4(v[4], v[5], v[6], v[7]);
+                    x_df[i*sram_stride + 2*p + b] = d[b];
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q5_K) {
             // part p: sub-blocks 2p and 2p+1, their d*sc and -dmin*m
             half2 * x_dm = (half2 *) (x_qs + MMQ_TILE_NE_K*2);
             const int p = part;

@@ -194,11 +194,10 @@ bool ggml_cuda_repack_supports_op(const ggml_tensor * op) {
 // ---------------------------------------------------------------------------------------------
 // Dequantization and GET_ROWS on repacked tensors.
 
-// Loads the GGUF bytes of block kb of row i of a stripe into blk.
+// Loads block kb of row i of a stripe into blk: the chunks, then the rest. For the K-quants this is the GGUF block.
 template <ggml_type type>
 static __device__ __forceinline__ void repack_load_block(const char * sx, const int64_t kb, const int i, const int r, const int64_t nkb, int * blk) {
     constexpr ggml_cuda_repack_layout L = ggml_cuda_repack_get_layout(type);
-    static_assert(L.rest_off == 16*L.nchunk || L.rest == 0, "rest must follow the chunks");
 #pragma unroll
     for (int c = 0; c < L.nchunk; ++c) {
         const int4 v = *(const int4 *) (sx + ggml_cuda_repack_chunk_offset(c, kb, i, r, nkb));
@@ -215,7 +214,58 @@ static __device__ __forceinline__ void repack_load_block(const char * sx, const 
 // Calls out(j, v) for the 8 values 8j..8j+7 of a block, with the same arithmetic as dequantize.cuh.
 template <ggml_type type, typename F>
 static __device__ __forceinline__ void repack_dequant_block(const int * blk, const F & out) {
-    if constexpr (type == GGML_TYPE_Q5_K) {
+    if constexpr (type == GGML_TYPE_Q4_0) {
+        // as dequantize_block_q4_0 in convert.cu; blk = 16 qs bytes, then d
+        const uint8_t * q = (const uint8_t *) blk;
+        const float d  = __half2float(*(const half *) (blk + 4));
+        const float dm = -8*d;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float v[8];
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int e = 8*j + l;
+                v[l] = e < 16 ? d * (q[e] & 0xF) + dm : d * (q[e - 16] >> 4) + dm;
+            }
+            out(j, v);
+        }
+    } else if constexpr (type == GGML_TYPE_Q8_0) {
+        // blk = 32 qs bytes, then d
+        const int8_t * q = (const int8_t *) blk;
+        const float d = __half2float(*(const half *) (blk + 8));
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float v[8];
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                v[l] = q[8*j + l];
+                v[l] *= d;
+            }
+            out(j, v);
+        }
+    } else if constexpr (type == GGML_TYPE_Q4_K) {
+        const block_q4_K * b = (const block_q4_K *) blk;
+        const float dall = __low2half(b->dm);
+        const float dmin = __high2half(b->dm);
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            uint8_t sc, m;
+            get_scale_min_k4(s, b->scales, sc, m);
+            const float d1 = dall * sc;
+            const float m1 = dmin * m;
+            const uint8_t * ql = b->qs + 32*(s/2);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float v[8];
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int k = 8*j + l;
+                    v[l] = d1 * (s % 2 == 0 ? ql[k] & 0xF : ql[k] >> 4) - m1;
+                }
+                out(4*s + j, v);
+            }
+        }
+    } else if constexpr (type == GGML_TYPE_Q5_K) {
         const block_q5_K * b = (const block_q5_K *) blk;
         const float dall = __low2half(b->dm);
         const float dmin = __high2half(b->dm);
@@ -284,53 +334,88 @@ static __device__ __forceinline__ void repack_store8(dst_t * dst, const float * 
     }
 }
 
-// One wave per stripe and block column, lane = row. dst is contiguous [ne3][ne2][ne1][ne0].
-template <ggml_type type, typename dst_t>
-static __global__ void k_dequant_repack(const char * __restrict__ x, dst_t * __restrict__ dst, const int64_t nkb, const int64_t ne1,
-        const int64_t ne2, const int64_t nb2, const int64_t nb3) {
+// One wave per stripe and 256 values of the rows, in two halves of 128 values. The wave decodes with lane = row
+// into shared memory, then writes 4 rows of 256 contiguous bytes per store. dst is contiguous f16 [ne3][ne2][ne1][ne0].
+template <ggml_type type>
+static __global__ void __launch_bounds__(GGML_CUDA_REPACK_ROWS) k_dequant_repack_f16(const char * __restrict__ x, half * __restrict__ dst,
+        const int64_t nkb, const int64_t ne1, const int64_t ne2, const int64_t nb2, const int64_t nb3) {
     constexpr ggml_cuda_repack_layout L = ggml_cuda_repack_get_layout(type);
-    constexpr int qk = ggml_cuda_type_traits<type>::qk;
-    const int64_t s0 = (int64_t) blockIdx.x*GGML_CUDA_REPACK_ROWS;
-    const int     r  = min((int64_t) GGML_CUDA_REPACK_ROWS, ne1 - s0);
-    const int     i  = threadIdx.x;
-    const int64_t kb = (int64_t) blockIdx.y*blockDim.y + threadIdx.y;
-    if (i >= r || kb >= nkb) {
-        return;
-    }
-    const int64_t i2 = blockIdx.z % ne2;
-    const int64_t i3 = blockIdx.z / ne2;
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int NB  = 256 / qk; // blocks per wave
+    constexpr int pad = 8;
+    __shared__ half tile[GGML_CUDA_REPACK_ROWS][128 + pad];
+
+    const int64_t s0  = (int64_t) blockIdx.x*GGML_CUDA_REPACK_ROWS;
+    const int     r   = min((int64_t) GGML_CUDA_REPACK_ROWS, ne1 - s0);
+    const int     i   = threadIdx.x;
+    const int64_t kb0 = (int64_t) blockIdx.y*NB;
+    const int64_t i2  = blockIdx.z % ne2;
+    const int64_t i3  = blockIdx.z / ne2;
     const char * sx = x + i2*nb2 + i3*nb3 + s0*nkb*L.bs;
-    dst_t * drow = dst + ((int64_t) blockIdx.z*ne1 + s0 + i)*nkb*qk;
-    {
-        int blk[(L.bs + 3)/4];
-        repack_load_block<type>(sx, kb, i, r, nkb, blk);
-        repack_dequant_block<type>(blk, [&](const int j, const float * v) {
-            repack_store8(drow + kb*qk + 8*j, v);
-        });
+
+    const int64_t ne0 = nkb*qk;
+    half * d0 = dst + ((int64_t) blockIdx.z*ne1 + s0)*ne0 + kb0*qk;
+
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        if (i < r) {
+#pragma unroll
+            for (int b = 0; b < NB; ++b) {
+                // values 128h..128h+127 of the wave
+                if ((NB == 1 || kb0 + b < nkb) && (NB == 1 || b/(NB/2) == h)) {
+                    int blk[(L.bs + 3)/4];
+                    repack_load_block<type>(sx, kb0 + b, i, r, nkb, blk);
+                    repack_dequant_block<type>(blk, [&](const int j, const float * v) {
+                        const int e = b*qk + 8*j - 128*h;
+                        if (e >= 0 && e < 128) {
+                            repack_store8(&tile[i][e], v);
+                        }
+                    });
+                }
+            }
+        }
+        __syncthreads();
+
+        const int nv = min((int64_t) 128, ne0 - kb0*qk - 128*h); // values of this half per row
+#pragma unroll 4
+        for (int row0 = 0; row0 < GGML_CUDA_REPACK_ROWS; row0 += 4) {
+            const int row   = row0 + threadIdx.x/16;
+            const int piece = threadIdx.x % 16;
+            if (row < r && 8*piece < nv) {
+                *(int4 *) (d0 + row*ne0 + 128*h + 8*piece) = *(const int4 *) &tile[row][8*piece];
+            }
+        }
+        __syncthreads();
     }
 }
 
-template <typename dst_t>
-static void ggml_cuda_repack_dequantize_t(const ggml_tensor * src0, dst_t * dst, cudaStream_t stream) {
+void ggml_cuda_repack_dequantize_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream) {
     GGML_ASSERT(ggml_cuda_tensor_is_repacked(src0));
-    const int64_t nkb  = src0->ne[0] / ggml_blck_size(src0->type);
-    const dim3 block(GGML_CUDA_REPACK_ROWS, 4, 1);
-    const dim3 grid((src0->ne[1] + GGML_CUDA_REPACK_ROWS - 1) / GGML_CUDA_REPACK_ROWS, (nkb + block.y - 1) / block.y, src0->ne[2]*src0->ne[3]);
+    const int64_t nkb = src0->ne[0] / ggml_blck_size(src0->type);
+    const int64_t nb  = 256 / ggml_blck_size(src0->type);
+    const dim3 block(GGML_CUDA_REPACK_ROWS, 1, 1);
+    const dim3 grid((src0->ne[1] + GGML_CUDA_REPACK_ROWS - 1) / GGML_CUDA_REPACK_ROWS, (nkb + nb - 1) / nb, src0->ne[2]*src0->ne[3]);
+    const char * x = (const char *) src0->data;
     switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+            k_dequant_repack_f16<GGML_TYPE_Q4_0><<<grid, block, 0, stream>>>(x, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
+            break;
+        case GGML_TYPE_Q8_0:
+            k_dequant_repack_f16<GGML_TYPE_Q8_0><<<grid, block, 0, stream>>>(x, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
+            break;
+        case GGML_TYPE_Q4_K:
+            k_dequant_repack_f16<GGML_TYPE_Q4_K><<<grid, block, 0, stream>>>(x, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
+            break;
         case GGML_TYPE_Q5_K:
-            k_dequant_repack<GGML_TYPE_Q5_K><<<grid, block, 0, stream>>>((const char *) src0->data, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
+            k_dequant_repack_f16<GGML_TYPE_Q5_K><<<grid, block, 0, stream>>>(x, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
             break;
         case GGML_TYPE_Q6_K:
-            k_dequant_repack<GGML_TYPE_Q6_K><<<grid, block, 0, stream>>>((const char *) src0->data, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
+            k_dequant_repack_f16<GGML_TYPE_Q6_K><<<grid, block, 0, stream>>>(x, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
             break;
         default:
             GGML_ABORT("unsupported repack type %s", ggml_type_name(src0->type));
     }
     CUDA_CHECK(cudaGetLastError());
-}
-
-void ggml_cuda_repack_dequantize_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream) {
-    ggml_cuda_repack_dequantize_t(src0, dst, stream);
 }
 
 // One block of 64 threads per row to get, thread t takes the block columns t, t+64, ...
@@ -361,6 +446,18 @@ void ggml_cuda_repack_get_rows(const ggml_tensor * src0, const ggml_tensor * src
     GGML_ASSERT(ggml_is_contiguous(src1) && ggml_nrows(dst) == nids && dst->nb[2] == dst->nb[1]*dst->ne[1] && dst->nb[3] == dst->nb[2]*dst->ne[2]);
     const int64_t stride_dst = dst->nb[1] / sizeof(float);
     switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+            k_get_rows_repack<GGML_TYPE_Q4_0><<<nids, 64, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data,
+                (float *) dst->data, nkb, src0->ne[1], 1, stride_dst);
+            break;
+        case GGML_TYPE_Q8_0:
+            k_get_rows_repack<GGML_TYPE_Q8_0><<<nids, 64, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data,
+                (float *) dst->data, nkb, src0->ne[1], 1, stride_dst);
+            break;
+        case GGML_TYPE_Q4_K:
+            k_get_rows_repack<GGML_TYPE_Q4_K><<<nids, 64, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data,
+                (float *) dst->data, nkb, src0->ne[1], 1, stride_dst);
+            break;
         case GGML_TYPE_Q5_K:
             k_get_rows_repack<GGML_TYPE_Q5_K><<<nids, 64, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data,
                 (float *) dst->data, nkb, src0->ne[1], 1, stride_dst);
