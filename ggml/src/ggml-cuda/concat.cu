@@ -165,6 +165,7 @@ static __global__ void __launch_bounds__(CONCAT_TILE*CONCAT_TILE_ROWS)
            int64_t   ne0,
            int64_t   ne1,
            int64_t   ne2,
+           int64_t   ne3,
           uint64_t   nb0,
           uint64_t   nb1,
           uint64_t   nb2,
@@ -173,40 +174,46 @@ static __global__ void __launch_bounds__(CONCAT_TILE*CONCAT_TILE_ROWS)
 
     const int64_t i00 = (int64_t) blockIdx.x*CONCAT_TILE;
     const int64_t i10 = (int64_t) blockIdx.y*CONCAT_TILE;
-    const int64_t i2  = blockIdx.z % ne2;
-    const int64_t i3  = blockIdx.z / ne2;
+
+    // grid z is limited to 65535, loop over the rest of dims 2 and 3
+    for (int64_t i23 = blockIdx.z; i23 < ne2*ne3; i23 += gridDim.z) {
+        const int64_t i2 = i23 % ne2;
+        const int64_t i3 = i23 / ne2;
 
 #pragma unroll
-    for (int y = threadIdx.y; y < CONCAT_TILE; y += CONCAT_TILE_ROWS) {
-        const int64_t i0 = i00 + y;
-        const int64_t i1 = i10 + threadIdx.x;
-        if (i0 >= ne0 || i1 >= ne1) {
-            continue;
+        for (int y = threadIdx.y; y < CONCAT_TILE; y += CONCAT_TILE_ROWS) {
+            const int64_t i0 = i00 + y;
+            const int64_t i1 = i10 + threadIdx.x;
+            if (i0 >= ne0 || i1 >= ne1) {
+                continue;
+            }
+            const char * x;
+            if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                x = src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00;
+            } else if constexpr (dim == 0) {
+                x = src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10;
+            } else if constexpr (dim == 1) {
+                x = src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10;
+            } else if constexpr (dim == 2) {
+                x = src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10;
+            } else {
+                x = src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10;
+            }
+            tile[y][threadIdx.x] = *(const T *) x;
         }
-        const char * x;
-        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-            x = src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00;
-        } else if constexpr (dim == 0) {
-            x = src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10;
-        } else if constexpr (dim == 1) {
-            x = src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10;
-        } else if constexpr (dim == 2) {
-            x = src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10;
-        } else {
-            x = src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10;
-        }
-        tile[y][threadIdx.x] = *(const T *) x;
-    }
 
-    __syncthreads();
+        __syncthreads();
 
 #pragma unroll
-    for (int y = threadIdx.y; y < CONCAT_TILE; y += CONCAT_TILE_ROWS) {
-        const int64_t i0 = i00 + threadIdx.x;
-        const int64_t i1 = i10 + y;
-        if (i0 < ne0 && i1 < ne1) {
-            *(T *) (dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = tile[threadIdx.x][y];
+        for (int y = threadIdx.y; y < CONCAT_TILE; y += CONCAT_TILE_ROWS) {
+            const int64_t i0 = i00 + threadIdx.x;
+            const int64_t i1 = i10 + y;
+            if (i0 < ne0 && i1 < ne1) {
+                *(T *) (dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = tile[threadIdx.x][y];
+            }
         }
+
+        __syncthreads();
     }
 }
 
@@ -235,8 +242,8 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else if (!ggml_is_quantized(src0->type) && (transposed(src0) || transposed(src1)) &&
-               dst->ne[2]*dst->ne[3] <= INT_MAX && (dst->ne[1] + CONCAT_TILE - 1)/CONCAT_TILE <= 65535) {
-        const dim3 grid_dim((dst->ne[0] + CONCAT_TILE - 1)/CONCAT_TILE, (dst->ne[1] + CONCAT_TILE - 1)/CONCAT_TILE, dst->ne[2]*dst->ne[3]);
+               (dst->ne[1] + CONCAT_TILE - 1)/CONCAT_TILE <= 65535) {
+        const dim3 grid_dim((dst->ne[0] + CONCAT_TILE - 1)/CONCAT_TILE, (dst->ne[1] + CONCAT_TILE - 1)/CONCAT_TILE, std::min<int64_t>(dst->ne[2]*dst->ne[3], 65535));
         const dim3 block_dim(CONCAT_TILE, CONCAT_TILE_ROWS, 1);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont_tiled<T, dim><<<grid_dim, block_dim, 0, stream>>>(
@@ -244,7 +251,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                 src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
                 src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
-                dst->ne[0], dst->ne[1], dst->ne[2],
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
                 dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
         };
         switch (dim) {

@@ -6189,13 +6189,7 @@ struct test_rope : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
-        if (v & 32) {
-            a = ggml_new_tensor_4d(ctx, type, ne_a[1], ne_a[0], ne_a[2], ne_a[3]);
-            ggml_set_name(a, "a");
-
-            a = ggml_transpose(ctx, a);
-            ggml_set_name(a, "view_of_a");
-        } else if (v & 1) {
+        if (v & 1) {
             auto ne = ne_a; ne[0] *= 2; ne[1] *= 4; ne[2] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
             if (forward && n_offs == 0) {
@@ -6891,7 +6885,13 @@ struct test_concat : public test_case {
         auto ne_b = ne_a;
         ne_b[dim] = ne_b_d;
         ggml_tensor * a;
-        if (v & 1) {
+        if (v & 32) {
+            a = ggml_new_tensor_4d(ctx, type, ne_a[1], ne_a[0], ne_a[2], ne_a[3]);
+            ggml_set_name(a, "a");
+
+            a = ggml_transpose(ctx, a);
+            ggml_set_name(a, "view_of_a");
+        } else if (v & 1) {
             auto ne = ne_a; ne[0] *= 2; ne[1] *= 4; ne[2] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(a, "a");
@@ -6934,6 +6934,9 @@ struct test_concat : public test_case {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
             ggml_set_name(b, "b");
         }
+
+        GGML_ASSERT(!(v & 32) || a->nb[0] > a->nb[1]);
+        GGML_ASSERT(!(v & 16) || b->nb[0] > b->nb[1]);
 
         ggml_tensor * out = ggml_concat(ctx, a, b, dim);
         ggml_set_name(out, "out");
@@ -11149,6 +11152,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 200, 1, 1}, 130, 0, 16));
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 129, 2, 1},  65, 0, 16));
+    // grid z = ne2*ne3 below and above 65535
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2, 2, 255, 257}, 2, 0, 48));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2, 2, 257, 257}, 2, 0, 48));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2, 2, 257, 257}, 3, 1, 16));
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
