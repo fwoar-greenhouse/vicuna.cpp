@@ -104,6 +104,40 @@ Every change is measured on the whole benchmark suite below, not on one model.
 
 Model-specific tuning (for example Qwen3.8-27B verify shapes) comes after this list.
 
+### Item 1 design: weight repack at load (2026-10-04)
+
+Goal: every wave load instruction reads 64 x 16 contiguous bytes that the wave uses fully, with one copy of the weights.
+
+Layout "S64" (same size as the GGUF layout, so row offsets, views at stripe boundaries and MoE expert slices keep their byte offsets):
+- Each 2D matrix (each expert of a MUL_MAT_ID stack) is cut into stripes of 64 rows; the last stripe has `ne1 % 64` rows if that is not 0. A stripe starts at the same byte offset as its first row in the GGUF layout and has the same size.
+- A block (K-quant superblock) is split into 16-byte chunks plus a small rest. Inside a stripe of `r` rows and `nkb` blocks per row, chunk `c` of block `kb` of row `i` is at `((c*nkb + kb)*r + i)*16` (plane-major). The rest bytes (Q6_K `d`) follow the planes as `[kb/8][row][8]` groups, so one lane reads the rests of 8 blocks with one 16-byte load.
+- Per type: Q4_K 144 B = 9 chunks (chunk 0 = d, dmin, packed scales); Q5_K 176 B = 11 chunks (chunk 0 = d, dmin, scales, then 2 qh, 8 qs); Q6_K 210 B = 13 chunks (8 ql, 4 qh, 1 scales) + 2 B d. The bytes inside a chunk are not changed, so the existing dequantization code works on a chunk after the load. Q8_0 / Q4_0 / IQ4_XS: the same with a unit of 8 / 8 / 2 blocks so that the d values fill whole chunks (later).
+- get_tensor runs the inverse transform, so the CPU fallback, `llama-quantize`-style reads and the round-trip tests see the GGUF layout.
+
+GEMV reader (MMVQ-R, 1-8 columns): one lane = one row, a wave = one stripe, the waves of a block (and, for small matrices, several blocks) split K. Each lane loads the 11/13 chunks of its block (all loads 1 KB contiguous per wave), so a lane holds a whole superblock and needs no cross-lane reduction. The q8_1 activation is the same for all lanes, so it is read with scalar loads (SGPRs) from the normal q8_1 buffer; no new activation layout is needed. Split-K partial sums are added in a fixed order (LDS inside a block, last-block fixup across blocks), so the result does not depend on timing.
+
+Other readers (all needed before the switch can be default ON, because a refused large-batch MUL_MAT would fall back to the CPU):
+- MMQ: `load_tiles` for the repacked types read whole 16-byte chunks with lane = row (64-row MMQ tile = one stripe, one superblock per iteration = 11/13 KB contiguous) and write the usual LDS tile, so `vec_dot` and the MFMA part do not change. Also for MUL_MAT_ID.
+- Dequantize to f16/f32 (hipBLAS path for large dense batches), GET_ROWS (one row = gather of its chunks).
+- MMVQ fusions (gate + GLU, bias) in MMVQ-R.
+
+Plumbing: a ROCm "extra" buffer type per device (`ROCm0_Repack`), returned by `ggml_backend_dev_get_extra_bufts` only if `GGML_HIP_REPACK=1` (later: default on, `GGML_HIP_REPACK=0` to disable). Device memory and allocation as the normal buffer; `set_tensor` uploads to a device scratch and runs a repack kernel per chunk of stripes (partial writes: read-modify-write of the touched stripes), `get_tensor` runs the inverse, `memset_tensor` of whole stripes is a plain memset, `cpy_tensor` only between two repack buffers. A tensor is repacked if it is in this buffer type, not a view, contiguous, and its type has a layout (and `ne0 % 256 == 0` for K-quants); other tensors in the buffer stay in the GGUF layout. `supports_op` refuses any op that reads a repacked tensor without a reader (MUL_MAT / MUL_MAT_ID src0, GET_ROWS src0). The model loader lists the extra GPU buffer types before the default one, so weights that the repack type accepts go there.
+
+Microbenchmark (standalone HIP, 1000-2000 back-to-back launches over 4+ copies of the weights so that they never sit in L2; the baseline is the real `mul_mat_vec_q` from mmvq.cu in the same harness):
+
+| matrix (rows x K) | Q5_K MMVQ | Q5_K S64 | Q6_K MMVQ | Q6_K S64 |
+|---|---:|---:|---:|---:|
+| 17408 x 5120, 1 col | 93.7 us (654 GB/s) | 69.0 us (888 GB/s) | 106.7 us (685) | 84.4 us (866) |
+| 5120 x 17408, 1 col | 94.1 us (651) | 70.3 us (871) | 115.7 us (632) | 85.2 us (859) |
+| 21504 x 5376, 1 col | 117.7 us (675) | 88.9 us (894) | 139.4 us (680) | 108.7 us (872) |
+| 6144 x 5120, 1 col | 37.8 us (572) | 27.4 us (788) | 39.7 us (650) | 35.0 us (737) |
+| 1024 x 5120, 1 col | 11.1 us | 10.0 us | 11.9 us | 12.5 us |
+| 17408 x 5120, 2 / 4 / 8 cols | 116.6 / 169.0 / 301.3 us | 74.6 / 86.2 / 192.4 us | 125.8 / 182.0 / 329.0 us | 101.4 / 104.8 / 206.8 us |
+
+- 1 column: +26..37% on the large matrices. A pure read of the same layout (no math) reaches ~950 GB/s and a plain streaming read of a 61 MB buffer ~1000 GB/s per launch on this card, so the S64 GEMV is at ~93% of the access-pattern ceiling.
+- 8 columns are VALU/scalar-load bound in this kernel (but still faster than MMVQ); MMQ-R (or the skinny MFMA kernel from item 2, which this layout also serves) takes over from ~5 columns.
+- Small matrices need the cross-block split: 1024 x 5120 Q5_K is 14.1 us with 4 waves per stripe and 10.0 us with 4 blocks of 4 waves.
+
 ### Item 2 status (2026-10-04)
 
 Done: MMVQ/MMQ crossover per type and matrix size (`mmvq_max_ncols`), MMQ register prefetch of the next x tile (two-phase `load_tiles`), MMQ J=16/32 with 4 warps, I=64, 2 blocks per CU.
