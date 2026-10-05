@@ -64,6 +64,15 @@ bool ggml_cuda_repack_supports_op(const ggml_tensor * op);
 // Largest number of columns for the repacked GEMV.
 #define GGML_CUDA_REPACK_MMVQ_MAX_COLS 8
 
+// MUL_MAT uses the repacked GEMV up to this many columns, MMQ above (MUL_MAT_ID: up to 8 tokens).
+static int ggml_cuda_repack_mmvq_max_cols(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q5_K: return 4;
+        case GGML_TYPE_Q6_K: return 6;
+        default:             return GGML_CUDA_REPACK_MMVQ_MAX_COLS;
+    }
+}
+
 // GEMV on a repacked src0 (MUL_MAT up to 8 columns, MUL_MAT_ID up to 8 tokens), y is q8_1, arguments as in mmvq.cu.
 void ggml_cuda_mul_mat_vec_q_repack(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
@@ -72,3 +81,8 @@ void ggml_cuda_mul_mat_vec_q_repack(
         int nsamples_dst, int64_t stride_sample_y, int64_t stride_sample_dst,
         int ids_stride, cudaStream_t stream);
 
+// Dequantizes a repacked src0 into a contiguous f16 tensor with the same shape.
+void ggml_cuda_repack_dequantize_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
+
+// GET_ROWS from a 2D repacked src0 into f32 rows.
+void ggml_cuda_repack_get_rows(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cudaStream_t stream);

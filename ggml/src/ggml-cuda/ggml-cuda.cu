@@ -1866,6 +1866,31 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// MUL_MAT with a repacked src0: GEMV for few columns, MMQ, else dequantize to f16 and hipBLAS
+static void ggml_cuda_mul_mat_repack(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc   = ggml_cuda_info().devices[ctx.device].cc;
+    const int64_t ne11 = src1->ne[1];
+    if (ne11 <= ggml_cuda_repack_mmvq_max_cols(src0->type)) {
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
+    ggml_cuda_repack_dequantize_f16(src0, src0_f16.get(), ctx.stream());
+    ggml_tensor src0_tmp = *src0;
+    src0_tmp.type     = GGML_TYPE_F16;
+    src0_tmp.data     = src0_f16.get();
+    src0_tmp.view_src = nullptr;
+    src0_tmp.nb[0]    = sizeof(half);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        src0_tmp.nb[i] = src0_tmp.nb[i - 1]*src0_tmp.ne[i - 1];
+    }
+    ggml_cuda_mul_mat_cublas(ctx, &src0_tmp, src1, dst);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1874,8 +1899,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     if (ggml_cuda_tensor_is_repacked(src0)) {
-        GGML_ASSERT(ne11 <= GGML_CUDA_REPACK_MMVQ_MAX_COLS);
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_repack(ctx, src0, src1, dst);
         return;
     }
 
@@ -1988,8 +2012,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
     if (ggml_cuda_tensor_is_repacked(src0)) {
-        GGML_ASSERT(ne2 <= GGML_CUDA_REPACK_MMVQ_MAX_COLS);
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+        if (ne2 <= GGML_CUDA_REPACK_MMVQ_MAX_COLS) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+        } else {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        }
         return;
     }
 
@@ -2151,7 +2178,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_repeat_back(ctx, dst);
             break;
         case GGML_OP_GET_ROWS:
-            ggml_cuda_op_get_rows(ctx, dst);
+            if (ggml_cuda_tensor_is_repacked(dst->src[0])) {
+                ggml_cuda_repack_get_rows(dst->src[0], dst->src[1], dst, ctx.stream());
+            } else {
+                ggml_cuda_op_get_rows(ctx, dst);
+            }
             break;
         case GGML_OP_GET_ROWS_BACK:
             ggml_cuda_op_get_rows_back(ctx, dst);
