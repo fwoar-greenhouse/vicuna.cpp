@@ -91,7 +91,7 @@ Goal: bring the gfx908 backend to parity with the CUDA backend across model type
 An item is generic if it helps a whole op family (all quant types, all head sizes) and not one model's shapes.
 Every change is measured on the whole benchmark suite below, not on one model.
 
-1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s. Done behind GGML_HIP_REPACK=1, see the status below; default on needs a decision.
+1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s. Done: weight repack on by default (`GGML_HIP_REPACK=0` to disable), see the status below. Open: recover dense pp8/pp16 and QAT pp512.
 2. [ ] Small-batch quantized matmul, 2-16 columns, all types (A12, A4, A6): multi-row MMVQ, then MFMA MMQ with wider J and 32x32 i8 tiles (P1, P5, P8).
 3. [x] Flash attention for 1-16 query rows, all head sizes and GQA ratios (A1, A2): split-KV MFMA with 4x4x4 / 16x16x16 shapes, including D=512 (P4). Done for D = 64/128/256/512, see the status below.
 3a. [x] Quantized KV cache in the tile and MMA FA kernels (A14): dequantize K/V tiles while loading them into LDS instead of converting the whole cache to f16 first. Done for the MMA kernel; the tile kernel only gets quantized K/V for D % 64 != 0.
@@ -121,7 +121,7 @@ Other readers (all needed before the switch can be default ON, because a refused
 - Dequantize to f16/f32 (hipBLAS path for large dense batches), GET_ROWS (one row = gather of its chunks).
 - MMVQ fusions (gate + GLU, bias) in MMVQ-R.
 
-Plumbing: a ROCm "extra" buffer type per device (`ROCm0_Repack`), returned by `ggml_backend_dev_get_extra_bufts` only if `GGML_HIP_REPACK=1` (later: default on, `GGML_HIP_REPACK=0` to disable). Device memory and allocation as the normal buffer; `set_tensor` uploads to a device scratch and runs a repack kernel per chunk of stripes (partial writes: read-modify-write of the touched stripes), `get_tensor` runs the inverse, `memset_tensor` of whole stripes is a plain memset, `cpy_tensor` only between two repack buffers. A tensor is repacked if it is in this buffer type, not a view, contiguous, and its type has a layout (and `ne0 % 256 == 0` for K-quants); other tensors in the buffer stay in the GGUF layout. `supports_op` refuses any op that reads a repacked tensor without a reader (MUL_MAT / MUL_MAT_ID src0, GET_ROWS src0). The model loader lists the extra GPU buffer types before the default one, so weights that the repack type accepts go there.
+Plumbing: a ROCm "extra" buffer type per device (`ROCm0_Repack`), returned by `ggml_backend_dev_get_extra_bufts` unless `GGML_HIP_REPACK=0`. Device memory and allocation as the normal buffer; `set_tensor` uploads to a device scratch and runs a repack kernel per chunk of stripes (partial writes: read-modify-write of the touched stripes), `get_tensor` runs the inverse, `memset_tensor` of whole stripes is a plain memset, `cpy_tensor` only between two repack buffers. A tensor is repacked if it is in this buffer type, not a view, contiguous, and its type has a layout (and `ne0 % 256 == 0` for K-quants); other tensors in the buffer stay in the GGUF layout. `supports_op` refuses any op that reads a repacked tensor without a reader (MUL_MAT / MUL_MAT_ID src0, GET_ROWS src0). The model loader lists the extra GPU buffer types before the default one, so weights that the repack type accepts go there.
 
 Microbenchmark (standalone HIP, 1000-2000 back-to-back launches over 4+ copies of the weights so that they never sit in L2; the baseline is the real `mul_mat_vec_q` from mmvq.cu in the same harness):
 
@@ -140,7 +140,7 @@ Microbenchmark (standalone HIP, 1000-2000 back-to-back launches over 4+ copies o
 
 ### Item 1 status (2026-10-05)
 
-Done behind `GGML_HIP_REPACK=1` (default still off, see "Decision needed" below): the `ROCm0_Repack` buffer type with the S64 layout for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS (matrices with >= 256 rows), and readers for every op that can read such a weight:
+Done, on by default since this change (`GGML_HIP_REPACK=0` restores the GGUF layout): the `ROCm0_Repack` buffer type with the S64 layout for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS (matrices with >= 256 rows), and readers for every op that can read such a weight:
 - MMVQ-R (`mmvq-repack.cu`): MUL_MAT up to 4 (Q5_K), 5 (Q4_K, IQ4_XS) or 6 (Q4_0, Q8_0, Q6_K) columns, all columns up to 8 for matrices with < 1024 rows, MUL_MAT_ID up to 8 tokens, gate + GLU and bias fusions. Q4_0/Q8_0 step over groups of 8 blocks (their d values are one 16-byte rest chunk); the full groups have no per-block branches (with them the loads waited: Q4_0 68 -> 57 us). Split K over blocks (last-block fixup in a fixed order) only for fewer than nsm/4 tiles; more blocks with fewer waves were slower in the models.
 - MMQ (`mmq-repack.cuh`): tile loaders with lane = row, same shared memory tile as before; MUL_MAT up to the MMQ limit and MUL_MAT_ID above 8 tokens.
 - hipBLAS path: dequantize into f16 through shared memory (lane = row decode, 256-byte row stores). This is 14-22% faster than the to_fp16 kernels of the GGUF layout for the K-quants (Q5_K 17408x5120 at 512 columns 1949 -> 1655 us).
@@ -166,7 +166,7 @@ Remaining gaps:
 - pp8/pp16 of the dense models are 1.5-2% slower: Q5_K/Q4_K MMQ with the repacked tile loader is 3-4% slower than on the GGUF layout (each warp loads the d/scales and qh chunks again; sharing them through shared memory with an extra barrier was 30% slower). 26B-A4B QAT pp512 -1.0% (Q4_0 MMQ, worst on 2816 x 2112).
 - MMVQ-R is 5-20% slower than MMVQ for small matrices that stay in L2 in test-backend-ops (1024 x 5120); not visible end to end.
 - Not repacked: Q3_K, IQ4_NL (1.5% of Qwen3.8-27B), other IQ types, matrices with < 256 rows.
-- Decision needed: switch the default to on (with `GGML_HIP_REPACK=0` to disable)? All tests and KLD gates pass and most cases are faster, but pp8/pp16 of the Q5_K dense models and QAT pp512 are 1-2% slower.
+- Default on (decided 2026-10-04). Known cost: pp8/pp16 of the Q5_K dense models and QAT pp512 are 1-2% slower than with `GGML_HIP_REPACK=0`; follow-up: extend the repacked GEMV past 8 columns or retune the crossover, and avoid per-warp scale reloads in the repacked MMQ loader.
 
 ### Item 2 status (2026-10-04)
 

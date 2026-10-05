@@ -1013,8 +1013,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int devic
 // GGML_HIP_REPACK=1 lists the repack buffer type as an extra buffer type of the device.
 static bool ggml_cuda_repack_enabled() {
     static const bool enabled = [] {
+        // On by default; GGML_HIP_REPACK=0 keeps the GGUF weight layout.
         const char * e = getenv("GGML_HIP_REPACK");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return enabled;
 }
