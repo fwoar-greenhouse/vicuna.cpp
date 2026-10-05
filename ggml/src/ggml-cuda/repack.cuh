@@ -109,8 +109,8 @@ void ggml_cuda_mul_mat_vec_q_repack(
         int nsamples_dst, int64_t stride_sample_y, int64_t stride_sample_dst,
         int ids_stride, cudaStream_t stream);
 
-// Dequantizes a repacked src0 into a contiguous f16 tensor with the same shape.
-void ggml_cuda_repack_dequantize_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
+// Dequantizes a repacked src0 into a contiguous tensor of type dst_type (f16, bf16 or f32) with the same shape.
+void ggml_cuda_repack_dequantize(const ggml_tensor * src0, void * dst, ggml_type dst_type, cudaStream_t stream);
 
 // GET_ROWS from a 2D repacked src0 into f32 rows.
 void ggml_cuda_repack_get_rows(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cudaStream_t stream);

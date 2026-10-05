@@ -418,7 +418,7 @@ static std::string var_to_str(ggml_type type) {
 }
 
 static std::string var_to_str(ggml_prec prec) {
-    return prec == GGML_PREC_F32 ? "f32" : "def";
+    return prec == GGML_PREC_F32 ? "f32" : prec == GGML_PREC_BF16 ? "bf16" : "def";
 }
 
 static std::string var_to_str(ggml_op_pool pool) {
@@ -5429,6 +5429,8 @@ struct test_repack : public test_case {
     const int64_t n_used; // MUL_MAT_ID: experts per token
     const int64_t v_off;  // MUL_MAT: the weight is a view of rows [v_off, v_off + m) of a weight with m + v_off + v_tail rows
     const int64_t v_tail;
+    const ggml_prec prec; // MUL_MAT: requested precision
+    const float     wmax; // weights are uniform in [-wmax, wmax]; > 65504 does not fit into f16
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5436,7 +5438,11 @@ struct test_repack : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR8(type, m, n, k, bs, n_used, v_off, v_tail);
+        std::string v = VARS_TO_STR8(type, m, n, k, bs, n_used, v_off, v_tail);
+        if (prec != GGML_PREC_DEFAULT || wmax != 1.0f) {
+            v += "," + VARS_TO_STR2(prec, wmax);
+        }
+        return v;
     }
 
     double max_nmse_err() override {
@@ -5455,8 +5461,8 @@ struct test_repack : public test_case {
     }
 
     test_repack(ggml_op op = GGML_OP_MUL_MAT, ggml_type type = GGML_TYPE_Q5_K, int64_t m = 64, int64_t n = 1, int64_t k = 256,
-            int64_t bs = 1, int64_t n_used = 1, int64_t v_off = 0, int64_t v_tail = 0)
-        : op(op), type(type), m(m), n(n), k(k), bs(bs), n_used(n_used), v_off(v_off), v_tail(v_tail) {}
+            int64_t bs = 1, int64_t n_used = 1, int64_t v_off = 0, int64_t v_tail = 0, ggml_prec prec = GGML_PREC_DEFAULT, float wmax = 1.0f)
+        : op(op), type(type), m(m), n(n), k(k), bs(bs), n_used(n_used), v_off(v_off), v_tail(v_tail), prec(prec), wmax(wmax) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         GGML_UNUSED(ctx);
@@ -5475,6 +5481,9 @@ struct test_repack : public test_case {
             ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, bs);
             ggml_set_name(b, "b");
             out = ggml_mul_mat(ctx, a, b);
+            if (prec != GGML_PREC_DEFAULT) {
+                ggml_prec_set_acc(out, prec);
+            }
         } else if (op == GGML_OP_MUL_MAT_ID) {
             ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type, k, m, bs);
             ggml_set_name(as, "as");
@@ -5503,7 +5512,8 @@ struct test_repack : public test_case {
         std::default_random_engine rng(4321);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type != GGML_TYPE_I32) {
-                init_tensor_uniform(t);
+                const float w = t->type == type ? wmax : 1.0f;
+                init_tensor_uniform(t, -w, w);
             } else if (op == GGML_OP_GET_ROWS && !ggml_is_view_op(t->op)) {
                 std::vector<int32_t> data(t->ne[0]);
                 for (auto & d : data) {
@@ -10501,6 +10511,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int n : {1, 7, 512}) {
             test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 333, n, 768, 1, 1, 0, 0));
         }
+        // hipBLAS fallback with a precision request: weights beyond the f16 range must not go through f16
+        for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_BF16}) {
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 333, 512, 768, 1, 1, 0, 0, prec, 1.0f));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 333, 512, 768, 1, 1, 0, 0, prec, 1e5f));
+        }
+        test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 256, 300, 512, 2, 1, 0, 0, GGML_PREC_F32, 1e5f));
         test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 1000, 5,   5120));
         test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 300,  300, 256));
     }

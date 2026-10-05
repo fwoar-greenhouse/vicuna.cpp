@@ -1672,7 +1672,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// The type in which hipBLAS gets src0 and src1: src0->type, f16 for quantized src0, raised by the precision of dst
+//     and overridden by GGML_CUDA_CUBLAS_COMPUTE_TYPE.
+static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0, const ggml_tensor * dst) {
     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type)) {
@@ -1701,8 +1703,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
     }
+    return compute_type;
+}
 
-    switch (compute_type) {
+static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    switch (ggml_cuda_mul_mat_cublas_compute_type(src0, dst)) {
         case GGML_TYPE_F32:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
             break;
@@ -1881,13 +1886,17 @@ static void ggml_cuda_mul_mat_repack(ggml_backend_cuda_context & ctx, const ggml
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
-    ggml_cuda_repack_dequantize_f16(src0, src0_f16.get(), ctx.stream());
+    // dequantize straight into the hipBLAS compute type, an f16 copy could overflow or lose precision
+    const ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, dst);
+    GGML_ASSERT(compute_type == GGML_TYPE_F16 || compute_type == GGML_TYPE_BF16 || compute_type == GGML_TYPE_F32);
+    const size_t ts = ggml_type_size(compute_type);
+    ggml_cuda_pool_alloc<char> src0_dq(ctx.pool(), ggml_nelements(src0)*ts);
+    ggml_cuda_repack_dequantize(src0, src0_dq.get(), compute_type, ctx.stream());
     ggml_tensor src0_tmp = *src0;
-    src0_tmp.type     = GGML_TYPE_F16;
-    src0_tmp.data     = src0_f16.get();
+    src0_tmp.type     = compute_type;
+    src0_tmp.data     = src0_dq.get();
     src0_tmp.view_src = nullptr;
-    src0_tmp.nb[0]    = sizeof(half);
+    src0_tmp.nb[0]    = ts;
     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
         src0_tmp.nb[i] = src0_tmp.nb[i - 1]*src0_tmp.ne[i - 1];
     }
