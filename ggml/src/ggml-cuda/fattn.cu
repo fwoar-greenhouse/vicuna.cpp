@@ -54,6 +54,28 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    // If gqa_ratio is not a power of 2 and there are enough Q rows, use the largest power of 2 that divides gqa_ratio:
+    //     a larger ncols2 would compute padded Q heads.
+    int ncols2_div = 1;
+    while (ncols2_div < 8 && gqa_ratio % (2*ncols2_div) == 0) {
+        ncols2_div *= 2;
+    }
+    if (use_gqa_opt && (gqa_ratio & (gqa_ratio - 1)) != 0 && Q->ne[1] >= 64/ncols2_div && (DKQ <= 256 || ncols2_div >= 2)) {
+        switch (ncols2_div) {
+            case 1:
+                if constexpr (DKQ <= 256) {
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+                }
+                return;
+            case 2:
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+                return;
+            default:
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+                return;
+        }
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;

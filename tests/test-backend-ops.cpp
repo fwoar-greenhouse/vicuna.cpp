@@ -12154,6 +12154,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // prompt processing with long KV, ubatch 1024
+    for (int kv : { 16384, 49152, }) {
+        for (auto [type_K, type_V] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+                {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256,  4, {6, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512,  4, {8, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+        }
+    }
     // prompt processing with quantized and mixed K/V
     for (int kv : { 4096, 16384, }) {
         for (int nb : { 32, 64, 512, }) {
