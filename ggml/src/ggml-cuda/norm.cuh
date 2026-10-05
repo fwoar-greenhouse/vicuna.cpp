@@ -10,10 +10,15 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 
-void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+// post_mul_tensor: optional mul of the result by a one value tensor; returns false (nothing done) if that is not supported
+bool ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
-                                     ggml_tensor *               add_tensor);
+                                     ggml_tensor *               add_tensor,
+                                     ggml_tensor *               post_mul_tensor = nullptr);
+
+// rms_norm -> scale -> mul, returns false (nothing done) if the shapes are not supported
+bool ggml_cuda_op_rms_norm_scale_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor, ggml_tensor * mul_tensor);
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

@@ -3746,6 +3746,43 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// rms_norm -> scale -> mul by a weight vector (e.g. a MoE router input), fused by some backends
+struct test_rms_norm_scale_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, scale);
+    }
+
+    test_rms_norm_scale_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float scale = 0.0625f)
+        : ne(ne), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_scale(ctx, ggml_rms_norm(ctx, a, 1e-6f), scale), w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -10103,6 +10140,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
+    test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 2816, 1, 1, 1 }, 1e-6f, false, false, true, false, true));
+    test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 5376, 3, 1, 1 }, 1e-6f, false, false, true, false, true));
+
+    for (int64_t n : {64, 256, 1000, 2816, 5376}) {
+        test_cases.emplace_back(new test_rms_norm_scale_mul({n, 3, 2, 1}));
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
@@ -11353,7 +11396,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.

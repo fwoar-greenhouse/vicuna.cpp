@@ -3247,6 +3247,40 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // rms_norm -> mul -> add -> mul by one value (e.g. a layer output scale)
+    if (ops.size() == 4 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL &&
+            ops.begin()[2] == GGML_OP_ADD && ops.begin()[3] == GGML_OP_MUL) {
+        const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * mul2 = cgraph->nodes[node_idx + 3];
+        const ggml_tensor * pm   = mul2->src[0] == add ? mul2->src[1] : mul2->src[0];
+        return ggml_cuda_can_fuse(cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {}) &&
+            mul2->type == GGML_TYPE_F32 && pm->type == GGML_TYPE_F32 && ggml_nelements(pm) == 1 && pm != add &&
+            ggml_are_same_shape(mul2, add);
+    }
+
+    // rms_norm -> scale -> mul
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE && ops.begin()[2] == GGML_OP_MUL) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * scale    = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * other    = mul->src[0] == scale ? mul->src[1] : mul->src[0];
+
+        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+
+        if (ggml_get_op_params_f32(scale, 1) != 0.0f || scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (mul->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || other == scale) {
+            return false;
+        }
+        // the norm output must be the full shape, the other operand is broadcast
+        if (!ggml_are_same_shape(mul, rms_norm) || !ggml_is_contiguous_rows(other) || !ggml_is_contiguous_rows(rms_norm->src[0])) {
+            return false;
+        }
+        return true;
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor * scale    = cgraph->nodes[node_idx+1];
@@ -4093,6 +4127,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL }, {}) &&
+            ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3])) {
+        return 3;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -4101,6 +4140,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }, {}) &&
+            ggml_cuda_op_rms_norm_scale_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
