@@ -602,6 +602,8 @@ void ggml_cuda_mul_mat_vec_q_repack(
 
     ggml_cuda_pool_alloc<float> partial(ctx.pool());
     if (kz > 1) {
+        // the counter ring is only safe on the main stream, see repack_counters_get
+        GGML_ASSERT(stream == ctx.stream());
         a.partial  = partial.alloc((size_t) ntiles*kz*(fusion.gate ? 2 : 1)*ncols*64);
         a.counters = ctx.repack_counters_get(ntiles);
     }

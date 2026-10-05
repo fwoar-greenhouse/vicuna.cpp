@@ -1,12 +1,14 @@
 // Round trip tests for the extra (repack) buffer types of the backends:
 // set_tensor -> get_tensor must give the same bytes, also for partial writes, reads, views and memset.
-// Run with GGML_HIP_REPACK=1 for the ROCm repack buffer type.
+// Also checks split-K GEMVs on repacked weights with a small counter ring against the CPU.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -112,7 +114,84 @@ static bool test_tensor(ggml_backend_buffer_type_t buft, ggml_type type, int64_t
     return ok;
 }
 
+// Many GEMVs that split K over blocks, in one graph that runs several times. With a ring of fewer counters than two
+// launches need (GGML_HIP_REPACK_COUNTERS, set in main), every launch reuses the counters of the one before, so a
+// kernel that does not leave its counters at 0 breaks the next one.
+static bool test_split_k_ring(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    const ggml_type type = GGML_TYPE_Q4_K;
+    const int64_t   k    = 2048; // 8 blocks per row: 2 blocks per stripe
+    const int64_t   m    = 1024; // 16 stripes, few enough for split K
+    const int       n_mm = 24;
+
+    std::vector<float> wf(k*m);
+    std::vector<float> xf(k*n_mm);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (float & v : wf) {
+        v = dist(rng);
+    }
+    for (float & v : xf) {
+        v = dist(rng);
+    }
+    std::vector<uint8_t> wq(ggml_row_size(type, k)*m);
+    ggml_quantize_chunk(type, wf.data(), wq.data(), 0, m, k, nullptr);
+
+    auto run = [&](ggml_backend_t backend, ggml_backend_buffer_type_t wbuft, std::vector<float> & out) {
+        ggml_init_params params = { ggml_tensor_overhead()*(2*n_mm + 8) + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx_w = ggml_init(params);
+        ggml_context * ctx   = ggml_init(params);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_w, type, k, m);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        std::vector<ggml_tensor *> xs, ys;
+        for (int i = 0; i < n_mm; i++) {
+            xs.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k));
+            ys.push_back(ggml_mul_mat(ctx, w, xs.back()));
+            ggml_build_forward_expand(gf, ys.back());
+        }
+        ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, wbuft);
+        ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
+        for (int i = 0; i < n_mm; i++) {
+            ggml_backend_tensor_set(xs[i], xf.data() + i*k, 0, k*sizeof(float));
+        }
+        out.assign(m*n_mm, 0.0f);
+        for (int it = 0; it < 3; it++) {
+            for (int i = 0; i < n_mm; i++) {
+                ggml_backend_tensor_memset(ys[i], 0, 0, ggml_nbytes(ys[i]));
+            }
+            ggml_backend_graph_compute(backend, gf);
+        }
+        for (int i = 0; i < n_mm; i++) {
+            ggml_backend_tensor_get(ys[i], out.data() + i*m, 0, m*sizeof(float));
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_backend_buffer_free(buf_w);
+        ggml_free(ctx);
+        ggml_free(ctx_w);
+    };
+
+    ggml_backend_t gpu = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    std::vector<float> out_gpu, out_cpu;
+    run(gpu, buft, out_gpu);
+    run(cpu, ggml_backend_get_default_buffer_type(cpu), out_cpu);
+    ggml_backend_free(gpu);
+    ggml_backend_free(cpu);
+
+    double err = 0.0, ref = 0.0;
+    for (size_t i = 0; i < out_cpu.size(); i++) {
+        err += (out_gpu[i] - out_cpu[i])*(out_gpu[i] - out_cpu[i]);
+        ref += out_cpu[i]*out_cpu[i];
+    }
+    const double nmse = err/ref;
+    const bool ok = std::isfinite(nmse) && nmse < 1e-3;
+    printf("  split-K GEMV x %d with a small counter ring: nmse %g %s\n", n_mm, nmse, ok ? "OK" : "FAIL");
+    return ok;
+}
+
 int main() {
+    // a ring of 24 counters: each launch of test_split_k_ring needs 16
+    setenv("GGML_HIP_REPACK_COUNTERS", "24", 0);
     ggml_backend_load_all();
 
     int n_tested = 0;
@@ -143,9 +222,13 @@ int main() {
                     }
                 }
             }
+            n_tested++;
+            if (!test_split_k_ring(dev, *b)) {
+                n_failed++;
+            }
         }
     }
-    printf("%d/%d round trip tests passed\n", n_tested - n_failed, n_tested);
+    printf("%d/%d tests passed\n", n_tested - n_failed, n_tested);
     if (n_tested == 0) {
         printf("no extra buffer types (set GGML_HIP_REPACK=1)\n");
     }

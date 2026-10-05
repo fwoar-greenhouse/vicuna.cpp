@@ -1223,19 +1223,24 @@ struct ggml_backend_cuda_context {
     }
 
     // Counters for the split-K fixup of the repacked GEMV. They are 0 between kernels: the last block of a tile resets
-    // its counter. Each launch takes the next range, so kernels on other streams or in one graph do not share counters.
-    static constexpr int REPACK_COUNTERS = 1 << 16;
+    // its counter. Each launch takes the next range of a ring. A range is reused only after a wrap-around, which is safe
+    // because all users run on the main stream (stream()), so the earlier kernel has finished and left its counters at 0.
+    // GGML_HIP_REPACK_COUNTERS sets a smaller ring for tests.
     int * repack_counters    = nullptr;
+    int   repack_counters_n  = 0;
     int   repack_counter_pos = 0;
 
     int * repack_counters_get(int n) {
-        GGML_ASSERT(n <= REPACK_COUNTERS);
         if (repack_counters == nullptr) {
+            const char * e = getenv("GGML_HIP_REPACK_COUNTERS");
+            repack_counters_n = e ? atoi(e) : 1 << 16;
+            GGML_ASSERT(repack_counters_n > 0);
             ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaMalloc(&repack_counters, REPACK_COUNTERS*sizeof(int)));
-            CUDA_CHECK(cudaMemsetAsync(repack_counters, 0, REPACK_COUNTERS*sizeof(int), stream()));
+            CUDA_CHECK(cudaMalloc(&repack_counters, repack_counters_n*sizeof(int)));
+            CUDA_CHECK(cudaMemsetAsync(repack_counters, 0, repack_counters_n*sizeof(int), stream()));
         }
-        if (repack_counter_pos + n > REPACK_COUNTERS) {
+        GGML_ASSERT(n <= repack_counters_n);
+        if (repack_counter_pos + n > repack_counters_n) {
             repack_counter_pos = 0;
         }
         int * p = repack_counters + repack_counter_pos;
