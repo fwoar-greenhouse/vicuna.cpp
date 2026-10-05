@@ -716,6 +716,78 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused add + unary + mul, e.g. softplus(x + dt_bias) * A of the gated delta net gates */
+
+template <float (*op)(float)>
+static __global__ void add_unary_mul_kernel(const float * x, const float * b, const float * a, float * dst,
+        const int64_t k, const int64_t nc, const int64_t sb, const int64_t sa) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t row = i / nc;
+    const int64_t c   = i - row*nc;
+    dst[i] = op(x[i] + b[row*sb + c]) * a[row*sa + c];
+}
+
+// b and a: one row of x->ne[0] values (broadcast) or the shape of x; everything f32 and contiguous
+bool ggml_cuda_should_fuse_add_unary_mul(const ggml_tensor * add_node, const ggml_tensor * unary_node, const ggml_tensor * mul_node) {
+    const ggml_unary_op uop = ggml_get_unary_op(unary_node);
+    if (uop != GGML_UNARY_OP_SOFTPLUS && uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    if (unary_node->src[0] != add_node || (mul_node->src[0] != unary_node && mul_node->src[1] != unary_node)) {
+        return false;
+    }
+    const ggml_tensor * x = add_node->src[0];
+    const ggml_tensor * b = add_node->src[1];
+    if (ggml_nelements(b) > ggml_nelements(x)) {
+        std::swap(x, b);
+    }
+    const ggml_tensor * a = mul_node->src[0] == unary_node ? mul_node->src[1] : mul_node->src[0];
+    const auto ok_operand = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+            (ggml_are_same_shape(t, x) || (t->ne[0] == x->ne[0] && ggml_nelements(t) == t->ne[0]));
+    };
+    return x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_are_same_shape(x, add_node) &&
+        add_node->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(mul_node) && ggml_are_same_shape(mul_node, x) && ok_operand(b) && ok_operand(a);
+}
+
+void ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    const ggml_tensor * x = add_node->src[0];
+    const ggml_tensor * b = add_node->src[1];
+    if (ggml_nelements(b) > ggml_nelements(x)) {
+        std::swap(x, b);
+    }
+    const ggml_tensor * a = mul_node->src[0] == unary_node ? mul_node->src[1] : mul_node->src[0];
+
+    const int64_t k  = ggml_nelements(mul_node);
+    const int64_t nc = x->ne[0];
+    const int64_t sb = ggml_nelements(b) == nc ? 0 : nc;
+    const int64_t sa = ggml_nelements(a) == nc ? 0 : nc;
+    const int     nb = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const float * xd = (const float *) x->data;
+    const float * bd = (const float *) b->data;
+    const float * ad = (const float *) a->data;
+    float       * dd = (float *) mul_node->data;
+    cudaStream_t stream = ctx.stream();
+
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SOFTPLUS:
+            add_unary_mul_kernel<op_softplus><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(xd, bd, ad, dd, k, nc, sb, sa);
+            break;
+        case GGML_UNARY_OP_SILU:
+            add_unary_mul_kernel<op_silu><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(xd, bd, ad, dd, k, nc, sb, sa);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            add_unary_mul_kernel<op_sigmoid><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(xd, bd, ad, dd, k, nc, sb, sa);
+            break;
+        default:
+            GGML_ABORT("unsupported unary op for fused add + unary + mul");
+    }
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

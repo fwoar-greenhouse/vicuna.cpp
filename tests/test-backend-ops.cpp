@@ -4096,6 +4096,43 @@ struct test_relu_sqr : public test_case {
 };
 
 // GGML_OP_UNARY(GELU|SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL (fused operation).
+// ADD -> UNARY -> MUL with broadcast rows (e.g. softplus(alpha + dt_bias) * A of the gated delta net)
+struct test_add_unary_mul : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+    const bool bcast_b; // the ADD operand is one row
+    const bool bcast_a; // the MUL operand is one row
+    const bool swap;    // operands of ADD and MUL in the other order
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return std::string("ADD_") + ggml_unary_op_name(op) + "_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, bcast_b, bcast_a, swap);
+    }
+
+    test_add_unary_mul(ggml_unary_op op, std::array<int64_t, 4> ne = {48, 4, 1, 1}, bool bcast_b = true, bool bcast_a = true, bool swap = false)
+        : op(op), ne(ne), bcast_b(bcast_b), bcast_a(bcast_a), swap(swap) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+        ggml_tensor * b = bcast_b ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]) : ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(b, "b");
+        ggml_tensor * a = bcast_a ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]) : ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * t = swap && !bcast_b ? ggml_add(ctx, b, x) : ggml_add(ctx, x, b);
+        t = ggml_unary(ctx, t, op);
+        ggml_tensor * out = swap && !bcast_a ? ggml_mul(ctx, a, t) : ggml_mul(ctx, t, a);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_unary_mul : public test_case {
     const ggml_unary_op op;
     const ggml_type type;
@@ -9518,6 +9555,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
+    }
+
+    // fused add + unary + mul
+    for (ggml_unary_op op : { GGML_UNARY_OP_SOFTPLUS, GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
+        test_cases.emplace_back(new test_add_unary_mul(op));
+        test_cases.emplace_back(new test_add_unary_mul(op, { 48, 1, 1, 1 }));
+        test_cases.emplace_back(new test_add_unary_mul(op, { 129, 7, 3, 2 }, false, true));
+        test_cases.emplace_back(new test_add_unary_mul(op, { 129, 7, 3, 2 }, true, false, true));
+        test_cases.emplace_back(new test_add_unary_mul(op, { 33, 5, 1, 1 }, false, false, true));
     }
 
     // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
