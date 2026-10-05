@@ -7149,6 +7149,63 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// several mul_mat with the same src1 (the CUDA backend reuses its q8_1 copy), then src1 is changed in place and used again
+// src1 is a graph input (src1_op = 0), rms_norm(x)*w (1) or glu(x0, x1) (2)
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int src1_op;
+
+    test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k, int src1_op)
+        : type(type), m(m), n(n), k(k), src1_op(src1_op) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, n, k, src1_op);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = nullptr;
+        if (src1_op == 1) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            b = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        } else if (src1_op == 2) {
+            ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * x1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            b = ggml_swiglu_split(ctx, x0, x1);
+        } else {
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        }
+        ggml_set_name(b, "b");
+
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * a2 = ggml_new_tensor_2d(ctx, type, k, m);
+
+        ggml_tensor * y0 = ggml_mul_mat(ctx, a0, b);
+        ggml_tensor * y1 = ggml_mul_mat(ctx, a1, b);
+        ggml_tensor * b2 = ggml_scale_inplace(ctx, b, 0.5f);
+        ggml_tensor * y2 = ggml_mul_mat(ctx, a2, b2);
+
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, y0, y1), y2);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -11287,6 +11344,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
     }
+
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (int64_t n : {1, 3, 8}) {
+            for (int src1_op : {0, 1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_shared_src1(type, 64, n, 512, src1_op));
+                test_cases.emplace_back(new test_mul_mat_shared_src1(type, 64, n, 2816, src1_op));
+            }
+        }
+    }
+
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.

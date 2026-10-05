@@ -4236,6 +4236,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            cuda_ctx->q8_1_cache_clear();
+            cuda_ctx->q8_1_cache_enabled = !ggml_cuda_info().devices[cuda_ctx->device].vmm; // the VMM pool frees in LIFO order only
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4280,6 +4283,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+                for (int j = i; j <= i + nodes_to_skip; ++j) {
+                    cuda_ctx->q8_1_cache_on_write(cgraph->nodes[j]);
+                }
+
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -4317,6 +4324,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            cuda_ctx->q8_1_cache_clear();
+            cuda_ctx->q8_1_cache_enabled = false;
         }
 
 #ifdef USE_CUDA_GRAPH

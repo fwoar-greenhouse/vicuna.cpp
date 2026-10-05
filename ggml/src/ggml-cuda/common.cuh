@@ -1221,6 +1221,121 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // q8_1 copies of f32 src1 tensors for MMVQ, kept during one graph evaluation.
+    // Later matmuls with the same src1 reuse them until a node writes to the src1 memory.
+    struct q8_1_cache_entry {
+        const void *     data = nullptr;
+        int64_t          ne[GGML_MAX_DIMS] = {0};
+        size_t           nb[GGML_MAX_DIMS] = {0};
+        size_t           nbytes = 0;
+        cudaStream_t     stream = nullptr;
+        ggml_cuda_pool * pool   = nullptr;
+        void *           q8_1   = nullptr;
+        size_t           size   = 0;
+        int64_t          last_use = 0;
+    };
+    static constexpr int Q8_1_CACHE_SIZE = 4;
+    q8_1_cache_entry q8_1_cache[Q8_1_CACHE_SIZE];
+    bool    q8_1_cache_enabled = false;
+    int64_t q8_1_cache_clock   = 0;
+
+    static bool q8_1_cache_match(const q8_1_cache_entry & e, const ggml_tensor * t) {
+        if (e.q8_1 == nullptr || e.data != t->data) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (e.ne[i] != t->ne[i] || e.nb[i] != t->nb[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void q8_1_cache_drop(q8_1_cache_entry & e) {
+        if (e.q8_1 != nullptr) {
+            e.pool->free(e.q8_1, e.size);
+        }
+        e = q8_1_cache_entry();
+    }
+
+    void q8_1_cache_clear() {
+        for (q8_1_cache_entry & e : q8_1_cache) {
+            q8_1_cache_drop(e);
+        }
+    }
+
+    // only tensors in a backend buffer: graph writes to them are seen by q8_1_cache_on_write, pool scratch is not
+    bool q8_1_cache_usable(const ggml_tensor * t) const {
+        if (!q8_1_cache_enabled || t->buffer == nullptr) {
+            return false;
+        }
+        const char * base = (const char *) ggml_backend_buffer_get_base(t->buffer);
+        const char * data = (const char *) t->data;
+        return data >= base && data + ggml_nbytes(t) <= base + ggml_backend_buffer_get_size(t->buffer);
+    }
+
+    // returns the cached q8_1 data of t, or nullptr
+    void * q8_1_cache_find(const ggml_tensor * t) {
+        if (!q8_1_cache_usable(t)) {
+            return nullptr;
+        }
+        for (q8_1_cache_entry & e : q8_1_cache) {
+            if (q8_1_cache_match(e, t) && e.stream == stream()) {
+                e.last_use = ++q8_1_cache_clock;
+                return e.q8_1;
+            }
+        }
+        return nullptr;
+    }
+
+    // allocates a cache entry for t with nbytes_q8_1 bytes, or returns nullptr if the cache is off
+    void * q8_1_cache_alloc(const ggml_tensor * t, size_t nbytes_q8_1) {
+        if (!q8_1_cache_usable(t)) {
+            return nullptr;
+        }
+        q8_1_cache_entry * dst = &q8_1_cache[0];
+        for (q8_1_cache_entry & e : q8_1_cache) {
+            if (q8_1_cache_match(e, t)) {
+                dst = &e;
+                break;
+            }
+            if (e.last_use < dst->last_use) {
+                dst = &e;
+            }
+        }
+        q8_1_cache_drop(*dst);
+        dst->data   = t->data;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            dst->ne[i] = t->ne[i];
+            dst->nb[i] = t->nb[i];
+        }
+        dst->nbytes   = ggml_nbytes(t);
+        dst->stream   = stream();
+        dst->pool     = &pool();
+        dst->q8_1     = dst->pool->alloc(nbytes_q8_1, &dst->size);
+        dst->last_use = ++q8_1_cache_clock;
+        return dst->q8_1;
+    }
+
+    // drops the entries whose src1 memory overlaps the output of node
+    void q8_1_cache_on_write(const ggml_tensor * node) {
+        if (node->data == nullptr) {
+            return;
+        }
+        const char * w0 = (const char *) node->data;
+        const char * w1 = w0 + ggml_nbytes(node);
+        for (q8_1_cache_entry & e : q8_1_cache) {
+            if (e.q8_1 == nullptr) {
+                continue;
+            }
+            const char * r0 = (const char *) e.data;
+            const char * r1 = r0 + e.nbytes;
+            if (w0 < r1 && r0 < w1) {
+                q8_1_cache_drop(e);
+            }
+        }
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
