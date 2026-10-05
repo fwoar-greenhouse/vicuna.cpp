@@ -278,6 +278,50 @@ FA op time, D=256 GQA 6 (Qwen3.8-27B shape), in-kernel -> converted: q8_0/q4_0 n
 
 llama-bench Qwen3.8-27B, KV q8_0/q4_0, `-ub 1024 -b 2048`, interleaved 2 rounds vs 5f34383 (KLD vs off, -c 2048, 3 chunks: 0.000000, same top p 100%): pp2048 974.6 -> 964.2 (-1.1%, noise: the first base run was 988), @ d16384 820.5 -> 827.7 (+0.9%), @ d49152 624.8 -> 646.9 (+3.5%).
 
+### Speculative decoding cycle (2026-10-05, 415f9e2)
+
+Setup: the production llama-server command (Qwen3.8-27B UD-Q5_K_S, `-np 2 -c 262144 --kv-unified`, KV q8_0/q4_0, `-b 2048 -ub 1024`, temp 1.0 / top-p 0.95 / top-k 20, reasoning effort medium), port 8011. Prompts: five ggml-cuda source files plus an instruction to refactor one function (76,540 tokens), and a short version of the same task (2,608 tokens). Per setting: one warm-up request (prefill), then 3 requests with `max_tokens` 1024 on the cached prompt. "Cycle" = one verify step of the target model; ms per cycle = eval time / cycles. MTP draft time from the `draft-mtp` statistics (`dur g`).
+
+Long prompt (76.5k depth), sums over the 3 requests:
+
+| setting | t/s | tokens per cycle | ms per cycle | MTP accept per position | MTP draft ms per cycle |
+|---|---:|---:|---:|---|---:|
+| `--spec-type none` | 30.8 | 1.00 | 32.4 | | |
+| draft-mtp n-max 1 | 48.3 | 1.94 | 40.3 | 0.94 | 2.7 |
+| draft-mtp n-max 2 | 59.1 | 2.83 | 47.8 | 0.94, 0.88 | 5.2 |
+| draft-mtp n-max 3 | 64.1 | 3.63 | 56.6 | 0.93, 0.87, 0.82 | 7.4 |
+| draft-mtp n-max 1 + ngram-mod | 53.9 | 3.04 | 56.5 | 0.94 | 2.7 |
+| draft-mtp n-max 2 + ngram-mod | 71.5 | 4.88 | 68.2 | 0.94, 0.87 | 5.2 |
+| draft-mtp n-max 3 + ngram-mod (production) | 77.0 | 5.86 | 76.1 | 0.91, 0.82, 0.71 | 7.5 |
+
+Short prompt (2.6k): none 33.8 t/s (29.6 ms per token); MTP only n-max 1/2/3: 53.2 / 67.7 / 70.9 t/s at 36.6 / 41.3 / 49.6 ms per cycle (MTP draft 2.1 / 4.0 / 6.0 ms); with ngram-mod n-max 1/2/3: 63.8 / 74.0 / 72.2 t/s.
+
+- The request-to-request spread is large with ngram-mod (44-166 t/s): this prompt makes the model copy code, ngram-mod drafts up to 64 tokens and those verify steps take 100+ ms. Without ngram-mod the 3 requests agree within 2%.
+- The MTP-only cycle at 76k depth is 56.6 ms with 3 drafted tokens, the same as the user's real run before the prefill work (57.6 ms at ~75k). The acceptance of this prompt is higher (mean length 3.6 vs 2.68). At the user's 2.68 the cycle gives 2.68 / 56.6 ms = 47 t/s; 60 t/s needs <= 44.7 ms.
+- Cost of one cycle at 76k: verify of 4 tokens ~46 ms + host ~3 ms (vs 32.4 ms for a single-token decode), MTP drafting 2.5 ms per drafted token.
+
+Kernel profile of the production setting at 76.5k depth (rocprofv3 `--kernel-trace`, 6 s window in the middle of a 2048-token generation, 44 regular MTP cycles; the profiler splits the HIP graph launches, so only kernel times are used, the host part comes from the unprofiled cycle time):
+
+| part of a cycle (3 drafted tokens) | ms | kernels |
+|---|---:|---:|
+| target verify forward (4 tokens), GPU busy | 45.8 | 2,119 |
+| - MMVQ-R (repacked GEMV, 4 columns) + MMVQ (non-repacked types) + MMQ | 29.5 + 1.3 + 0.3 | 395 + 100 + 4 |
+| - FA vector kernel (16 attention layers, 76k KV) + combine | 5.1 + 0.1 | 32 |
+| - gated_delta_net (48 layers) | 1.6 | 48 |
+| - small kernels (rms_norm 1.5, cpy/set_rows 1.4, quantize_q8_1 1.2, glu 1.0, binbcast 1.0, get_rows 0.6, concat 0.4, rope 0.3, ssm_conv 0.3, other 0.3) | 8.0 | ~1,620 |
+| MTP draft forwards (3 steps + MTP update with the accepted tokens), GPU busy | 7.7 | 192 |
+| - MMVQ-R (MTP layer and the 248k-vocab output matrix) | 4.9 | 32 |
+| - FA vector kernel (MTP layer, 76k KV) | 1.5 | 4 |
+| - top-k / argsort (draft sampling) | 0.5 | 33 |
+| - other small kernels and copies | 0.8 | ~120 |
+| host and gaps (sampling, synchronization, recurrent-state rollback): 56.6 - 53.5 | ~3.1 | |
+
+- The 4-column verify GEMV moves the 17.1 GB of weights at ~580 GB/s (the 1-column MMVQ-R reaches ~870 GB/s in the microbenchmark above): MMVQ-R at 4 columns is 64% of the cycle and the largest lever. A 4-column GEMV at the 1-column speed would save ~10 ms per cycle (56.6 -> ~46 ms).
+- Small kernels still cost ~8 ms per verify (~1,620 launches at ~4.5 us).
+- FA at 76k: 5.1 ms per verify (16 layers, 320 us each) plus 1.5 ms in the MTP layer.
+- MTP drafting (7.7 ms) is dominated by the output matrix GEMV, once per drafted token.
+- Reaching 44.7 ms per cycle at 3 drafted tokens needs ~12 ms less: e.g. the 4-column GEMV at near 1-column bandwidth (~10 ms) plus fewer small kernels, or 2 drafted tokens (47.8 ms now) with a faster verify.
+
 ### Benchmark suite
 
 All under `~/.cache/huggingface/hub/`, run with `HIP_VISIBLE_DEVICES=0 llama-bench -ngl 99 -fa 1 -p 2,4,8,16,512 -n 128`:
