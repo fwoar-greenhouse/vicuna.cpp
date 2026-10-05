@@ -1222,6 +1222,27 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 
+    // Counters for the split-K fixup of the repacked GEMV. They are 0 between kernels: the last block of a tile resets
+    // its counter. Each launch takes the next range, so kernels on other streams or in one graph do not share counters.
+    static constexpr int REPACK_COUNTERS = 1 << 16;
+    int * repack_counters    = nullptr;
+    int   repack_counter_pos = 0;
+
+    int * repack_counters_get(int n) {
+        GGML_ASSERT(n <= REPACK_COUNTERS);
+        if (repack_counters == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaMalloc(&repack_counters, REPACK_COUNTERS*sizeof(int)));
+            CUDA_CHECK(cudaMemsetAsync(repack_counters, 0, REPACK_COUNTERS*sizeof(int), stream()));
+        }
+        if (repack_counter_pos + n > REPACK_COUNTERS) {
+            repack_counter_pos = 0;
+        }
+        int * p = repack_counters + repack_counter_pos;
+        repack_counter_pos += n;
+        return p;
+    }
+
     // q8_1 copies of f32 src1 tensors for MMVQ, kept during one graph evaluation.
     // Later matmuls with the same src1 reuse them until a node writes to the src1 memory.
     struct q8_1_cache_entry {

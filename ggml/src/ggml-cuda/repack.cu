@@ -148,8 +148,42 @@ void ggml_cuda_repack_get_tensor(const ggml_tensor * tensor, void * data, size_t
     memcpy(data, tmp.data() + (offset - b0*bs), size);
 }
 
-bool ggml_cuda_repack_supports_op(const ggml_tensor * op) {
-    // no readers yet
-    GGML_UNUSED(op);
-    return false;
+// A view of a repacked tensor can be read if it is a range of whole stripes of each matrix (the last one may end early).
+static bool ggml_cuda_repack_view_ok(const ggml_tensor * t) {
+    const ggml_tensor * base = t->view_src;
+    if (!base) {
+        return true;
+    }
+    if (t->type != base->type || t->ne[0] != base->ne[0] || t->nb[1] != base->nb[1] || t->nb[2] != base->nb[2] || t->nb[3] != base->nb[3]) {
+        return false;
+    }
+    const size_t offs = (const char *) t->data - (const char *) base->data;
+    if (offs % base->nb[1] != 0 || offs >= base->nb[2]) {
+        return false;
+    }
+    const int64_t r0 = offs / base->nb[1];
+    const int64_t r1 = r0 + t->ne[1];
+    return r0 % GGML_CUDA_REPACK_ROWS == 0 && r1 <= base->ne[1] && (r1 % GGML_CUDA_REPACK_ROWS == 0 || r1 == base->ne[1]) &&
+        t->ne[2] <= base->ne[2] && t->ne[3] <= base->ne[3];
 }
+
+bool ggml_cuda_repack_supports_op(const ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    if (!src0 || !ggml_cuda_tensor_is_repacked(src0) || !ggml_cuda_repack_view_ok(src0)) {
+        return false;
+    }
+    for (int i = 1; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && ggml_cuda_tensor_is_repacked(op->src[i])) {
+            return false;
+        }
+    }
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            return op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->ne[1] <= GGML_CUDA_REPACK_MMVQ_MAX_COLS;
+        case GGML_OP_MUL_MAT_ID:
+            return op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->ne[2] <= GGML_CUDA_REPACK_MMVQ_MAX_COLS;
+        default:
+            return false;
+    }
+}
+

@@ -1476,16 +1476,6 @@ struct test_case {
                 return test_status_t::FAIL;
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            if (weights_in_extra_buft()) {
-                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
-                    if (!ggml_backend_supports_op(backend1, t)) {
-                        test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
-                                           false, false, "not supported");
-                        print_test_result_locked(output_printer, result);
-                        return test_status_t::NOT_SUPPORTED;
-                    }
-                }
-            }
         }
 
         // allocate
@@ -1494,6 +1484,18 @@ struct test_case {
         if (buf == NULL) {
             printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
             return test_status_t::FAIL;
+        }
+
+        // the support of ops on weights in an extra buffer type can depend on the buffer
+        if (ctx_weights && weights_in_extra_buft()) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (!ggml_backend_supports_op(backend1, t)) {
+                    test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                                       false, false, "not supported");
+                    print_test_result_locked(output_printer, result);
+                    return test_status_t::NOT_SUPPORTED;
+                }
+            }
         }
 
         // build graph
@@ -1640,13 +1642,11 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            if (weights_in_extra_buft()) {
-                ggml_backend_buffer_type_t extra = get_extra_buft(backend);
-                if (!extra) {
-                    return true;
-                }
+            ggml_backend_buffer_type_t extra = weights_in_extra_buft() ? get_extra_buft(backend) : nullptr;
+            if (extra) {
                 buf_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), extra));
             } else {
+                // without an extra buffer type: the same case on the default buffer type, as a baseline
                 buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
             }
             if (buf_weights == NULL) {
@@ -1654,12 +1654,6 @@ struct test_case {
                 return false;
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            if (weights_in_extra_buft() && !ggml_backend_supports_op(backend, out)) {
-                test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", false, false,
-                                   "not supported");
-                output_printer->print_test_result(result);
-                return true;
-            }
         }
 
         // allocate
@@ -1668,6 +1662,13 @@ struct test_case {
         if (buf == NULL) {
             printf("failed to allocate tensors\n");
             return false;
+        }
+
+        if (ctx_weights && weights_in_extra_buft() && !ggml_backend_supports_op(backend, out)) {
+            test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", false, false,
+                               "not supported");
+            output_printer->print_test_result(result);
+            return true;
         }
 
         // randomize tensors
@@ -7412,12 +7413,13 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const bool repack; // the weights are in the extra buffer type of the device
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool repack = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), repack(repack) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
@@ -7429,11 +7431,12 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "MUL_MAT_VEC_FUSION";
+        return repack ? "REPACK_MUL_MAT_VEC_FUSION" : "MUL_MAT_VEC_FUSION";
     }
 
     bool run_whole_graph() override { return true; }
-    bool use_weight_context() override { return use_id && with_lane_scale; }
+    bool use_weight_context() override { return (use_id && with_lane_scale) || repack; }
+    bool weights_in_extra_buft() override { return repack; }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
         ggml_tensor * out = nullptr;
@@ -7478,9 +7481,10 @@ struct test_mul_mat_vec_fusion : public test_case {
             std::array<int64_t, 4> ne       = { k, m, channels, samples };
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
+            ggml_context * ctx_w = repack ? ctx_weights : ctx;
             ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
-            ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, type, 4, ne0.data()) : nullptr;
-            ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
+            ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx_w, type, 4, ne0.data()) : nullptr;
+            ggml_tensor * up   = ggml_new_tensor(ctx_w, type, 4, ne0.data());
 
             auto build_lane_up = [&]() {
                 ggml_tensor * ffn_up = ggml_mul_mat(ctx, up, cur);
@@ -7520,8 +7524,9 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_set_name(out, "out");
             return out;
         } else {
-            ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
-            ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+            ggml_context * ctx_w = repack ? ctx_weights : ctx;
+            ggml_tensor * gates = ggml_new_tensor_3d(ctx_w, type, k, n, n_mats);
+            ggml_tensor * ups   = ggml_new_tensor_3d(ctx_w, type, k, n, n_mats);
             ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
 
             if (n_used != n_mats) {
@@ -11563,6 +11568,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // fusions with the weights in the extra buffer type of the device (MI100 repack)
+    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+            for (bool with_bias : {false, true}) {
+                for (bool with_gate : {false, true}) {
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 100, 512,
+                        false, 1, 1, false, with_bias, with_gate, false, {1, 1}, true));
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 64, 256,
+                        false, 1, 1, false, with_bias, with_gate, false, {4, 2}, true));
+                    for (int64_t m_batch : {1, 3}) {
+                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 136, 512,
+                            true, 8, 2, false, with_bias, with_gate, false, {1, 1}, true));
+                    }
+                }
+            }
+        }
     }
 
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {

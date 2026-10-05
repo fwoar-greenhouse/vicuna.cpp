@@ -61,3 +61,14 @@ void ggml_cuda_repack_get_tensor(const ggml_tensor * t, void * data, size_t offs
 // Ops that can read a repacked src.
 bool ggml_cuda_repack_supports_op(const ggml_tensor * op);
 
+// Largest number of columns for the repacked GEMV.
+#define GGML_CUDA_REPACK_MMVQ_MAX_COLS 8
+
+// GEMV on a repacked src0 (MUL_MAT up to 8 columns, MUL_MAT_ID up to 8 tokens), y is q8_1, arguments as in mmvq.cu.
+void ggml_cuda_mul_mat_vec_q_repack(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        int ncols_dst, int stride_col_y, int stride_col_dst,
+        int nchannels_y, int nchannels_dst, int stride_channel_y, int stride_channel_dst,
+        int nsamples_dst, int64_t stride_sample_y, int64_t stride_sample_dst,
+        int ids_stride, cudaStream_t stream);
+

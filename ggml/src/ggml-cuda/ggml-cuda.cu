@@ -645,6 +645,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (repack_counters != nullptr) {
+        CUDA_CHECK(cudaFree(repack_counters));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -1786,6 +1789,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    if (ggml_cuda_tensor_is_repacked(ffn_up->src[0]) != ggml_cuda_tensor_is_repacked(ffn_gate->src[0])) {
+        return false;
+    }
+
     if (ffn_up->src[1] != ffn_gate->src[1]) {
         return false;
     }
@@ -1863,6 +1870,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_TENSOR_BINARY_OP_LOCALS
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    if (ggml_cuda_tensor_is_repacked(src0)) {
+        GGML_ASSERT(ne11 <= GGML_CUDA_REPACK_MMVQ_MAX_COLS);
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
 
@@ -1973,6 +1986,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    if (ggml_cuda_tensor_is_repacked(src0)) {
+        GGML_ASSERT(ne2 <= GGML_CUDA_REPACK_MMVQ_MAX_COLS);
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -5160,11 +5179,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
-    // a repacked tensor can only be read by ops that know the layout
-    if (ggml_cuda_tensor_is_repacked(op)) {
+    // a repacked tensor can only be read by ops that know the layout (views do not read)
+    const bool is_view_op = op->op == GGML_OP_VIEW || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_PERMUTE ||
+        op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_NONE;
+    if (!is_view_op && ggml_cuda_tensor_is_repacked(op)) {
         return false;
     }
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
+    for (int i = 0; i < GGML_MAX_SRC && !is_view_op; i++) {
         if (op->src[i] && ggml_cuda_tensor_is_repacked(op->src[i])) {
             if (!ggml_cuda_repack_supports_op(op)) {
                 return false;
