@@ -180,6 +180,7 @@ The HIP backend shares its implementation with the `ggml-cuda` sources, so its r
 
 - `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` enables unified memory on Linux, allowing allocations to spill to system RAM instead of failing when VRAM is exhausted (this hurts performance on discrete GPUs).
 - `GGML_CUDA_P2P` enables peer-to-peer access between multiple GPUs so they can transfer data directly rather than through system memory. May cause crashes or corrupted outputs on some motherboards and BIOS settings (e.g. IOMMU).
+- `GGML_HIP_FA_KV_F16=0` turns off the f16 copy of a quantized K/V cache that FlashAttention makes for large batches (prompt processing) with head size 256. The copy makes prompt processing faster but needs space for the whole visible K and V in f16 in the compute buffer (e.g. 940 MiB more for Qwen3.8-27B with a q8_0/q4_0 cache at 262144 context). Set it to 0 if memory is tight.
 
 ### Performance Tuning
 

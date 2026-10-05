@@ -130,6 +130,32 @@ static bool ggml_cuda_fattn_mma_need_f16(const ggml_type type, const int64_t D) 
     return type == GGML_TYPE_F32 || (type != GGML_TYPE_F16 && D % 64 != 0);
 }
 
+// For large batches with head size 256 it is faster to convert K/V to f16 once per call and run the f16 kernel
+//     (measured on MI100, other head sizes and q4_0 K are faster with in-kernel conversion).
+//     The f16 copy of K/V needs space in the compute buffer, GGML_HIP_FA_KV_F16=0 turns this off.
+static bool ggml_cuda_fattn_mma_kv_to_f16(const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_HIP_FA_KV_F16");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!enabled || K->ne[0] != 256 || V->ne[0] != 256 || K->type == GGML_TYPE_Q4_0) {
+        return false;
+    }
+    // A GQA ratio that is a power of 2 gets more Q heads per block in the f16 kernel, the gain starts later.
+    const int64_t gqa = Q->ne[2] / K->ne[2];
+    if ((gqa & (gqa - 1)) != 0) {
+        return Q->ne[1] >= 256;
+    }
+    return gqa >= 2 && gqa <= 4 && Q->ne[1] >= 1024;
+}
+
+static bool ggml_cuda_fattn_mma_need_f16(const ggml_tensor * dst, const ggml_tensor * KV, const int64_t D) {
+    return ggml_cuda_fattn_mma_need_f16(KV->type, D) || (KV->type != GGML_TYPE_F16 && ggml_cuda_fattn_mma_kv_to_f16(dst));
+}
+
 // Swizzling needs ldmatrix, on AMD the tiles keep the row padding.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ, const int DV, const int ncols1, const int ncols2) {
     GGML_UNUSED_VARS(DKQ, DV, ncols1, ncols2);
@@ -1573,8 +1599,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    const bool need_f16_K = ggml_cuda_fattn_mma_need_f16(dst->src[1]->type, DKQ);
-    const bool need_f16_V = ggml_cuda_fattn_mma_need_f16(dst->src[2]->type, DV);
+    const bool need_f16_K = ggml_cuda_fattn_mma_need_f16(dst, dst->src[1], DKQ);
+    const bool need_f16_V = ggml_cuda_fattn_mma_need_f16(dst, dst->src[2], DV);
     auto is_q = [](const ggml_type type) {
         return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0;
     };

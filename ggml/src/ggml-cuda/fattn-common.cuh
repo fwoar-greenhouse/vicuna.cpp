@@ -137,6 +137,79 @@ static __device__ __forceinline__ uint32_t ggml_cuda_fattn_qh_to_bytes(const uin
     return ((vh << 4) & 0x00000010) | ((vh << 11) & 0x00001000) | ((vh << 18) & 0x00100000) | ((vh << 25) & 0x10000000);
 }
 
+// q8_0/q4_0 K or V with row strides -> contiguous f16, one 32-value block per thread.
+template <ggml_type type>
+static __global__ void k_fattn_kv_to_f16(const char * __restrict__ x, half * __restrict__ dst, const int nblk, const int ne1,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne1*nblk) {
+        return;
+    }
+    const int i1 = i / nblk;
+    const int j  = i % nblk;
+    const char * src = x + blockIdx.z*nb3 + blockIdx.y*nb2 + i1*nb1;
+
+    half2 h[16];
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        int qs[8];
+        half d;
+        ggml_cuda_fattn_load_unaligned<2>(&d, src + j*sizeof(block_q8_0));
+        ggml_cuda_fattn_load_unaligned<32>(qs, src + j*sizeof(block_q8_0) + 2);
+        const half2 d2 = make_half2(d, d);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int q = qs[k];
+            h[2*k + 0] = __hmul2(d2, make_half2(int8_t(q), int8_t(q >> 8)));
+            h[2*k + 1] = __hmul2(d2, make_half2(int8_t(q >> 16), int8_t(q >> 24)));
+        }
+    } else {
+        static_assert(type == GGML_TYPE_Q4_0, "bad type");
+        int qs[4];
+        half d;
+        ggml_cuda_fattn_load_unaligned<2>(&d, src + j*sizeof(block_q4_0));
+        ggml_cuda_fattn_load_unaligned<16>(qs, src + j*sizeof(block_q4_0) + 2);
+        const half2 d2 = make_half2(d, d);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int q = qs[k];
+#pragma unroll
+            for (int l = 0; l < 2; ++l) {
+                const int a = (q >> (16*l)) & 0xFF;
+                const int b = (q >> (16*l + 8)) & 0xFF;
+                h[2*k + l]     = __hmul2(d2, make_half2((a & 0xF) - 8, (b & 0xF) - 8));
+                h[8 + 2*k + l] = __hmul2(d2, make_half2((a >> 4) - 8, (b >> 4) - 8));
+            }
+        }
+    }
+    int4 * y = (int4 *) (dst + (((int64_t) blockIdx.z*gridDim.y + blockIdx.y)*ne1 + i1)*nblk*32 + j*32);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        y[k] = ((const int4 *) h)[k];
+    }
+}
+
+// Converts K or V to f16 in dst, contiguous in the logical order of t.
+static void ggml_cuda_fattn_kv_to_f16(const ggml_tensor * t, const char * data, half * dst, cudaStream_t stream) {
+    const int64_t ts = ggml_type_size(t->type);
+    if (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_0) {
+        const int nblk = t->ne[0] / 32;
+        const int n    = t->ne[1]*nblk;
+        const dim3 grid((n + 255) / 256, t->ne[2], t->ne[3]);
+        if (t->type == GGML_TYPE_Q8_0) {
+            k_fattn_kv_to_f16<GGML_TYPE_Q8_0><<<grid, 256, 0, stream>>>(data, dst, nblk, t->ne[1], t->nb[1], t->nb[2], t->nb[3]);
+        } else {
+            k_fattn_kv_to_f16<GGML_TYPE_Q4_0><<<grid, 256, 0, stream>>>(data, dst, nblk, t->ne[1], t->nb[1], t->nb[2], t->nb[3]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    } else if (ggml_is_contiguous(t)) {
+        ggml_get_to_fp16_cuda(t->type)(data, dst, ggml_nelements(t), stream);
+    } else {
+        GGML_ASSERT(t->nb[0] == ts);
+        ggml_get_to_fp16_nc_cuda(t->type)(data, dst, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t->nb[1]/ts, t->nb[2]/ts, t->nb[3]/ts, stream);
+    }
+}
+
 typedef void (*dequantize_V_t)(const void *, void *, const int64_t);
 
 template <typename T, int ne>
@@ -767,30 +840,12 @@ void launch_fattn(
     size_t nb23 = V->nb[3];
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
-        const size_t bs = ggml_blck_size(K->type);
-        const size_t ts = ggml_type_size(K->type);
-
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
-        if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-
-            nb11 = nb11*bs*sizeof(half)/ts;
-            nb12 = nb12*bs*sizeof(half)/ts;
-            nb13 = nb13*bs*sizeof(half)/ts;
-        } else {
-            GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
-            const int64_t s01 = nb11 / ts;
-            const int64_t s02 = nb12 / ts;
-            const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
-
-            nb11 = K->ne[0] * sizeof(half);
-            nb12 = K->ne[1] * nb11;
-            nb13 = K->ne[2] * nb12;
-        }
+        ggml_cuda_fattn_kv_to_f16(K, K_data, K_f16, main_stream);
+        nb11 = K->ne[0] * sizeof(half);
+        nb12 = K->ne[1] * nb11;
+        nb13 = K->ne[2] * nb12;
         K_data = (char *) K_f16;
     }
 
@@ -801,31 +856,12 @@ void launch_fattn(
             nb22   = nb12;
             nb23   = nb13;
         } else {
-            const size_t bs = ggml_blck_size(V->type);
-            const size_t ts = ggml_type_size(V->type);
-
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
-            if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-                V_data = (char *) V_f16;
-
-                nb21 = nb21*bs*sizeof(half)/ts;
-                nb22 = nb22*bs*sizeof(half)/ts;
-                nb23 = nb23*bs*sizeof(half)/ts;
-            } else {
-                GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
-                const int64_t s01 = nb21 / ts;
-                const int64_t s02 = nb22 / ts;
-                const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
-
-                nb21 = V->ne[0] * sizeof(half);
-                nb22 = V->ne[1] * nb21;
-                nb23 = V->ne[2] * nb22;
-            }
+            ggml_cuda_fattn_kv_to_f16(V, V_data, V_f16, main_stream);
+            nb21 = V->ne[0] * sizeof(half);
+            nb22 = V->ne[1] * nb21;
+            nb23 = V->ne[2] * nb22;
             V_data = (char *) V_f16;
         }
     }

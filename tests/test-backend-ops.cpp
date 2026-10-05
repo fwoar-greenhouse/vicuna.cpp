@@ -11390,7 +11390,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
         for (int hs : { 64, 128, 256, }) {
-            for (int nb : { 32, 64, }) {
+            for (int nb : { 32, 64, 300, }) {
                 for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
                 }
@@ -11502,6 +11502,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {3, 1}, 2048, nb, true, true,  0,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 2048, nb, true, true,  0,  0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
     }
+
+    // large batches with quantized or mixed K/V (on ROCm converted to f16 per call)
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1536, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1536, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 260, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 1024, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {3, 1}, 1024, 260, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_BF16, {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1024, 260, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -12172,7 +12182,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // prompt processing with quantized and mixed K/V
     for (int kv : { 4096, 16384, }) {
-        for (int nb : { 32, 64, 512, }) {
+        for (int nb : { 32, 64, 128, 256, 512, }) {
             for (auto [type_K, type_V] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
                     {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));

@@ -264,7 +264,19 @@ Remaining gaps (FA is now ~17% of long prefill, at ~36 of ~185 TFLOP/s):
 - Load pipelining needs a register budget that the current kernel does not have: e.g. Q in LDS, a smaller VKQ tile per wave or a kernel built for CDNA (32x32 MFMA for VKQ, P in registers). This is a new kernel, not a tuning step.
 - Causal-mask tile skipping matters only at small depth (< 2% of the tiles at 16k).
 - gdn_chunk_scan is latency bound (1 block of 4 waves per CU, ~24 us per chunk vs ~9 us of MFMA work); gdn_chunk_prep is latency bound in its K K^T phase.
-- Decision for the user: K/V conversion to f16 per call for large batches would make q8_0/q4_0 as fast as f16 (10.7 vs 11.6 ms at 16k) but brings back the f16 copy of the whole visible K/V in the compute buffer (~850 MiB at 262k context).
+- Done since (decided for speed): K/V conversion to f16 per call for large batches, see below.
+
+### FA f16 K/V conversion for large batches (2026-10-05)
+
+For head size 256 and a quantized K/V cache (K not q4_0), the MMA path converts the visible K and V to f16 once per FA call and runs the f16 kernel: from 256 Q rows if the GQA ratio is not a power of 2 (Qwen3.8-27B: 6), from 1024 rows for GQA 2 or 4. The conversion kernel reads one 32-value q8_0/q4_0 block per thread with the row strides of the cache view (the generic `to_fp16_nc` path reached ~60 GB/s on these views and cost ~0.5 ms at 16k). Small batches, the vector kernel and all other shapes keep the in-kernel dequantization.
+
+`GGML_HIP_FA_KV_F16=0` turns it off. Cost: the f16 copy of K and V in the compute buffer, Qwen3.8-27B (production server command, `-c 262144 -ub 1024`, KV q8_0/q4_0): ROCm0 compute buffer 756.3 MiB (off) -> 1696.3 MiB (on).
+
+Where it was measured not to help (test-backend-ops perf, f16 path incl. conversion vs in-kernel): D=64/128 (+6..+80%), D=512 GQA 8 (+12..+52%, the f16 D=512 kernel is slower than the q8_0/q4_0 instance), D=256 GQA 8/16 (+4..+20%), q4_0 K (+0..+20%), D=256 GQA 2/4 below 1024 rows.
+
+FA op time, D=256 GQA 6 (Qwen3.8-27B shape), in-kernel -> converted: q8_0/q4_0 nb=1024 kv=16384 11.61 -> 10.86 ms (-6.4%), kv=49152 34.35 -> 31.92 ms (-7.1%); nb=512 kv=16384 5.86 -> 5.54 ms; q8_0/q8_0 nb=512 kv=16384 6.21 -> 5.54 ms (-10.7%). GQA 2, q8_0/q4_0, nb=1024: kv=16384 -3.5%, kv=49152 -4.5%.
+
+llama-bench Qwen3.8-27B, KV q8_0/q4_0, `-ub 1024 -b 2048`, interleaved 2 rounds vs 5f34383 (KLD vs off, -c 2048, 3 chunks: 0.000000, same top p 100%): pp2048 974.6 -> 964.2 (-1.1%, noise: the first base run was 988), @ d16384 820.5 -> 827.7 (+0.9%), @ d49152 624.8 -> 646.9 (+3.5%).
 
 ### Benchmark suite
 
