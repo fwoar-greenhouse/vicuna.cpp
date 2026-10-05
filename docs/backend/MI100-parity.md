@@ -91,7 +91,7 @@ Goal: bring the gfx908 backend to parity with the CUDA backend across model type
 An item is generic if it helps a whole op family (all quant types, all head sizes) and not one model's shapes.
 Every change is measured on the whole benchmark suite below, not on one model.
 
-1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s. Done: weight repack on by default (`GGML_HIP_REPACK=0` to disable), see the status below. Open: recover dense pp8/pp16 and QAT pp512.
+1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s. Done: weight repack on by default (`GGML_HIP_REPACK=0` to disable), repacked GEMV for 2-8 columns at 3+ waves per SIMD (see the verify step status below). Open: dense pp16 and QAT pp512 (MMQ), 4-column GEMV at ~755 vs ~870 GB/s at 1 column.
 2. [ ] Small-batch quantized matmul, 2-16 columns, all types (A12, A4, A6): multi-row MMVQ, then MFMA MMQ with wider J and 32x32 i8 tiles (P1, P5, P8).
 3. [x] Flash attention for 1-16 query rows, all head sizes and GQA ratios (A1, A2): split-KV MFMA with 4x4x4 / 16x16x16 shapes, including D=512 (P4). Done for D = 64/128/256/512, see the status below.
 3a. [x] Quantized KV cache in the tile and MMA FA kernels (A14): dequantize K/V tiles while loading them into LDS instead of converting the whole cache to f16 first. Done for the MMA kernel; the tile kernel only gets quantized K/V for D % 64 != 0.
@@ -141,7 +141,7 @@ Microbenchmark (standalone HIP, 1000-2000 back-to-back launches over 4+ copies o
 ### Item 1 status (2026-10-05)
 
 Done, on by default since this change (`GGML_HIP_REPACK=0` restores the GGUF layout): the `ROCm0_Repack` buffer type with the S64 layout for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS (matrices with >= 256 rows), and readers for every op that can read such a weight:
-- MMVQ-R (`mmvq-repack.cu`): MUL_MAT up to 4 (Q5_K), 5 (Q4_K, IQ4_XS) or 6 (Q4_0, Q8_0, Q6_K) columns, all columns up to 8 for matrices with < 1024 rows, MUL_MAT_ID up to 8 tokens, gate + GLU and bias fusions. Q4_0/Q8_0 step over groups of 8 blocks (their d values are one 16-byte rest chunk); the full groups have no per-block branches (with them the loads waited: Q4_0 68 -> 57 us). Split K over blocks (last-block fixup in a fixed order) only for fewer than nsm/4 tiles; more blocks with fewer waves were slower in the models.
+- MMVQ-R (`mmvq-repack.cu`): MUL_MAT up to 8 columns (Q4_K, Q5_K, Q6_K, Q8_0), 7 (IQ4_XS) or 6 (Q4_0, and all types below 16M weights), all columns up to 8 for matrices with < 1024 rows, MUL_MAT_ID up to 8 tokens, gate + GLU (1 column) and bias fusions. Q4_0/Q8_0 step over groups of 4/8 blocks (their d values are 8/16 bytes of one rest chunk); the full groups have no per-block branches (with them the loads waited: Q4_0 68 -> 57 us). Since bd5810a (see the verify status below): buffer loads, 3+ waves per SIMD, blocks of 4 waves, split K over blocks for few tiles (last-block fixup in a fixed order).
 - MMQ (`mmq-repack.cuh`): tile loaders with lane = row, same shared memory tile as before; MUL_MAT up to the MMQ limit and MUL_MAT_ID above 8 tokens.
 - hipBLAS path: dequantize into f16 through shared memory (lane = row decode, 256-byte row stores). This is 14-22% faster than the to_fp16 kernels of the GGUF layout for the K-quants (Q5_K 17408x5120 at 512 columns 1949 -> 1655 us).
 - GET_ROWS of 2D weights; stripe-aligned views (start on a stripe, end on a stripe or at the end of the matrix).
@@ -321,6 +321,48 @@ Kernel profile of the production setting at 76.5k depth (rocprofv3 `--kernel-tra
 - FA at 76k: 5.1 ms per verify (16 layers, 320 us each) plus 1.5 ms in the MTP layer.
 - MTP drafting (7.7 ms) is dominated by the output matrix GEMV, once per drafted token.
 - Reaching 44.7 ms per cycle at 3 drafted tokens needs ~12 ms less: e.g. the 4-column GEMV at near 1-column bandwidth (~10 ms) plus fewer small kernels, or 2 drafted tokens (47.8 ms now) with a faster verify.
+
+### Speculative decoding verify step (2026-10-05, bd5810a and 8733206)
+
+Why the 4-column repacked GEMV ran at ~580 GB/s (in the model and in test-backend-ops; the 86 us of the design microbenchmark was a different kernel variant): the kernel is latency bound. Inside a wave the weight loads of a unit and its math do not overlap, so the kernel only reaches the memory rate with many waves per SIMD (with the math removed it moves ~880-940 GB/s at the same occupancy, with it the time was close to load time + math time). At 2-4 columns it had:
+- ~100 VGPRs (2 waves per SIMD, one 8-wave block per CU): ~22 VGPRs for 64-bit per-chunk addresses, the loop counter and addresses in VGPRs (the split of K into waves uses a division that runs on the VALU), and SGPR spills of the y pointers into VGPR lanes.
+- Loads split by the scheduler into 4+ groups that each waited (vs all 11-13 loads first at 1 column), and ~15 scalar-load waits for y per unit.
+- 272 blocks for 17408 rows on 120 CUs (3 rounds), 80 blocks for 5120 rows (80 CUs busy); Q5_K went to MMQ from 5 columns at half the GEMV speed.
+
+Changes (bd5810a): buffer loads (one lane offset, chunk offset in an SGPR), readfirstlane for the loop bounds, math per q8_1 sub-block with y loaded one sub-block ahead, kernels built for 3 waves per SIMD (Q5_K 4 columns: 101 -> 57 VGPRs), blocks of 4 waves (8 for fewer tiles than CUs), split K over blocks for few tiles (target ~320 waves for 1-2 columns, ~960 for 3+), Q4_0 steps over 4 blocks for 2+ columns; crossover to MMQ at 8 columns (Q4_K/Q5_K/Q6_K/Q8_0), 7 (IQ4_XS), 6 (Q4_0, and all types below 16M weights). 8733206 fuses add + softplus + mul of the DeltaNet gate (-96 launches per forward).
+
+REPACK_MUL_MAT perf, 17408 x 5120, GB/s (before -> after):
+
+| type | 1 col | 2 cols | 4 cols | 5 cols | 8 cols |
+|---|---:|---:|---:|---:|---:|
+| Q5_K | 825 -> 869 | 703 -> 826 | 578 -> 778 | 395 (MMQ) -> 709 | 392 (MMQ) -> 478 |
+| Q6_K | 791 -> 835 | 742 -> 810 | 562 -> 719 | 481 -> 655 | 350 (MMQ) -> 476 |
+| Q4_K | 862 -> 878 | 695 -> 829 | 546 -> 758 | 443 -> 668 | 358 (MMQ) -> 462 |
+| IQ4_XS | 683 -> 715 | 568 -> 717 | 416 -> 573 | 363 -> 499 | 356 (MMQ) |
+| Q4_0 | 879 -> 876 | 787 -> 834 | 542 -> 719 | 362 -> 638 | 393 (MMQ) |
+| Q8_0 | 907 -> 924 | 874 -> 904 | 768 -> 852 | 758 -> 828 | 622 (MMQ) -> 703 |
+
+5120 x 17408 at 4 columns: Q5_K 657 -> 751, Q6_K 617 -> 705 GB/s. Small matrices that stay in L2 (K = 2816) and Q8_0 at 3-4 columns on 6144 x 5120 are up to ~10% slower than before; not visible end to end. MUL_MAT_ID (128 experts, 8 used): within -2..+11%.
+
+llama-bench `-fa 1`, interleaved 2-3 rounds per commit, 36c7034 -> 8733206 (t/s):
+
+| model | pp2 | pp3 | pp4 | pp5 | pp8 | pp16 | pp512 | tg128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.8-27B Q5_K_S | 58.6 -> 63.5 | 84.6 -> 91.2 | 97.9 -> 114.2 | 93.9 -> 126.8 | 135.7 -> 150.6 | +-1% | +-1% | 35.6 -> 37.1 |
+| Gemma 4 31B Q5_K_XL | 56.8 -> 59.4 | 81.2 -> 83.0 | 96.6 -> 106.2 | 85.6 -> 119.6 | 123.3 -> 139.0 | +-1% | +-1% | 31.3 -> 32.1 |
+
+26B-A4B and QAT: pp2/pp4/pp8/tg128 within +-2% (noise). KLD (Qwen, -ub 4, -c 1024, 4 chunks) vs before: 0.00162 (before ub 4 vs ub 512: 0.00185).
+
+MTP cycle at 76.5k depth (production command with MTP only, ms per cycle, interleaved runs): 3 drafted tokens 57.2 -> 50.1, 2: 48.1 -> 45.4, 1: 40.3 -> 37.7. At the user's mean accepted length of 2.68 the 3-token cycle gives ~53.5 t/s (was ~47).
+
+Kernel profile of a 3-drafted-token cycle at 76.5k depth (52 cycles, kernel times): verify forward 38.9 ms GPU busy (was 45.8) = repacked GEMV 22.4 ms (387 kernels, ~755 GB/s, was 29.5 ms), FA vector 5.0, other MMVQ (non-repacked 48-row DeltaNet alpha/beta Q8_0 at 13.9 us each, Q3_K/IQ4_NL) 1.4, gated_delta_net 1.6, rms_norm 1.6, cpy/set_rows 1.3, quantize_q8_1 1.1, unary/glu 1.0, get_rows 0.7, binbcast 0.6 (was 1.0), concat 0.4, rope/ssm_conv/other 0.9 (~1,980 kernels); MTP drafting 7.6 ms (repacked GEMV 4.8 ms, FA 1.5, top-k 0.5); host and gaps ~3.6 ms.
+
+Tried without gain:
+- Software pipelining of units (loads of the next unit before the math of the current one): needs ~2x the data VGPRs, 2 waves per SIMD with spills; 15-50% slower.
+- y in LDS (copied with the weight loads, broadcast reads): the scheduler hoists all LDS reads (up to 256 VGPRs); with 2 waves per SIMD neutral. y spread over the lanes with v_readlane into SGPRs: 9 us slower than scalar loads at 4 columns.
+- Gate + GLU fusion of the repacked GEMV for 2-8 columns (both matrices in one kernel): 5-13% slower at pp4-pp8 (twice the work per wave, fewer waves; also with x and gate units one after the other).
+
+Remaining gap to 44.7 ms per cycle (3 drafted tokens): ~5.4 ms. Candidates: the 4-column GEMV (22.4 ms, ~755 GB/s vs ~870 at 1 column; a kernel with loads and math overlapped inside the wave needs fewer VGPRs per unit, e.g. half-block units), the 48-row Q8_0 GEMVs (96 x 14 us; split K or one launch for alpha and beta), concat + ssm_conv + conv-state copy in one kernel (~0.6 ms), quantize_q8_1 inside the producers (1.1 ms), the MTP draft (7.6 ms) and host gaps (~3.6 ms).
 
 ### Benchmark suite
 
