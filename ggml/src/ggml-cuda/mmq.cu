@@ -276,7 +276,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return true;
 #endif //GGML_CUDA_FORCE_MMQ
 
-    if (n_experts > 64 || ne11 <= 128) {
+    // MUL_MAT_ID: the hipBLAS path sorts the tokens on the host (stream syncs, no HIP graphs) and is slower on CDNA1
+    if (n_experts > 0 || ne11 <= 128) {
         return true;
     }
     if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1) {
