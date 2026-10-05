@@ -10444,36 +10444,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
-    // weights in the extra buffer type of the device (MI100 repack, GGML_HIP_REPACK=1), skipped if there is none
+    // weights in the extra buffer type of the device (MI100 repack, GGML_HIP_REPACK=1), skipped if there is none.
+    // Matrices with fewer than 256 rows are not repacked; odd row counts test the last stripe.
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
         for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33, 200}) {
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 64,   n, 256));
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 165,  n, 2816));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 256,  n, 256));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 293,  n, 2816));
             test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 1024, n, 5120));
         }
         for (int n : {1, 2, 4, 8, 16, 64}) {
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 100, n, 512, 3));
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 37,  n, 512, 1, 1, 64));      // view to the end
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 300, n, 512, 3));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 37,  n, 512, 1, 1, 256));     // view to the end
             test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 128, n, 512, 1, 1, 128, 64)); // view of whole stripes
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 61,  n, 512, 1, 1, 3, 0));    // view not on a stripe
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 136, n, 2816, 8, 2));
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 64,  n, 512, 32, 4));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 261, n, 512, 1, 1, 3, 0));    // view not on a stripe
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 264, n, 2816, 8, 2));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 256, n, 512, 32, 4));
         }
         for (int n : {1, 7, 512}) {
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 77, n, 768, 1, 1, 0, 0));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 333, n, 768, 1, 1, 0, 0));
         }
         test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 1000, 5,   5120));
-        test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 70,   300, 256));
+        test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 300,  300, 256));
     }
     // Q4_0/Q8_0 with K % 256 != 0: the last group of 8 blocks is partial (MoE down projections, K = 704)
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
         for (int n : {1, 3, 8, 16, 100}) {
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 130, n, 704));
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 64,  n, 704, 8, 2));
-            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 70,  n, 96));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 330, n, 704));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 256, n, 704, 8, 2));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 270, n, 96));
         }
-        test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 77, 9, 704));
+        test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 277, 9, 704));
     }
+    // fewer rows than GGML_CUDA_REPACK_MIN_ROWS: stays in the GGUF layout inside the extra buffer
+    test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, GGML_TYPE_Q8_0, 48, 8, 5120));
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
@@ -11584,12 +11587,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             for (bool with_bias : {false, true}) {
                 for (bool with_gate : {false, true}) {
-                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 100, 512,
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 300, 512,
                         false, 1, 1, false, with_bias, with_gate, false, {1, 1}, true));
-                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 64, 256,
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 256, 256,
                         false, 1, 1, false, with_bias, with_gate, false, {4, 2}, true));
                     for (int64_t m_batch : {1, 3}) {
-                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 136, 512,
+                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 264, 512,
                             true, 8, 2, false, with_bias, with_gate, false, {1, 1}, true));
                     }
                 }

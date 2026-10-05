@@ -11,6 +11,9 @@
 
 #define GGML_CUDA_REPACK_ROWS 64
 
+// Matrices with fewer rows stay in the GGUF layout.
+#define GGML_CUDA_REPACK_MIN_ROWS 256
+
 struct ggml_cuda_repack_layout {
     int bs;       // bytes per block
     int nchunk;   // 16 byte chunks per block
@@ -86,7 +89,7 @@ bool ggml_cuda_repack_supports_op(const ggml_tensor * op);
 #define GGML_CUDA_REPACK_MMVQ_MAX_COLS 8
 
 // MUL_MAT uses the repacked GEMV up to this many columns, MMQ above (MUL_MAT_ID: up to 8 tokens).
-static int ggml_cuda_repack_mmvq_max_cols(const ggml_type type) {
+static constexpr int ggml_cuda_repack_mmvq_max_cols(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0: return 6;
         case GGML_TYPE_Q8_0: return 6;

@@ -7,8 +7,9 @@
 #include <vector>
 
 bool ggml_cuda_repack_eligible(const ggml_tensor * t) {
+    // matrices with few rows (e.g. 48 rows of the GDN alpha/beta) have too few stripes for the repacked GEMV
     return t->view_src == nullptr && ggml_cuda_repack_type_supported(t->type) && ggml_is_contiguous(t) &&
-        t->ne[0] % ggml_blck_size(t->type) == 0;
+        t->ne[0] % ggml_blck_size(t->type) == 0 && t->ne[1] >= GGML_CUDA_REPACK_MIN_ROWS;
 }
 
 bool ggml_cuda_tensor_is_repacked(const ggml_tensor * t) {

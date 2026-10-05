@@ -127,8 +127,9 @@ int main() {
         for (ggml_backend_buffer_type_t * b = get_extra_bufts(dev); b && *b; ++b) {
             printf("%s: %s\n", ggml_backend_dev_name(dev), ggml_backend_buft_name(*b));
             const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_F16 };
+            // the repack buffer keeps matrices with fewer than 256 rows in the GGUF layout
             const int64_t shapes[][3] = {
-                { 256,    1, 1}, { 512,   63, 1}, {5120,   64, 1}, {1024,  130, 1}, {2816, 704, 3}, {256, 77, 5},
+                { 256,    1, 1}, { 512,   63, 1}, {5120,  256, 1}, {1024,  301, 1}, {2816, 704, 3}, {256, 277, 5},
                 {4096, 1000, 1}, {1536, 4097, 1},
             };
             for (ggml_type type : types) {
