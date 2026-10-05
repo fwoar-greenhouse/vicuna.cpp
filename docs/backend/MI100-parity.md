@@ -91,7 +91,7 @@ Goal: bring the gfx908 backend to parity with the CUDA backend across model type
 An item is generic if it helps a whole op family (all quant types, all head sizes) and not one model's shapes.
 Every change is measured on the whole benchmark suite below, not on one model.
 
-1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s.
+1. [ ] Decode GEMV bandwidth for all quant types (A12): weight repack at load and a load-first MMVQ (P1, P2). Target ~1.0 TB/s. Done behind GGML_HIP_REPACK=1, see the status below; default on needs a decision.
 2. [ ] Small-batch quantized matmul, 2-16 columns, all types (A12, A4, A6): multi-row MMVQ, then MFMA MMQ with wider J and 32x32 i8 tiles (P1, P5, P8).
 3. [x] Flash attention for 1-16 query rows, all head sizes and GQA ratios (A1, A2): split-KV MFMA with 4x4x4 / 16x16x16 shapes, including D=512 (P4). Done for D = 64/128/256/512, see the status below.
 3a. [x] Quantized KV cache in the tile and MMA FA kernels (A14): dequantize K/V tiles while loading them into LDS instead of converting the whole cache to f16 first. Done for the MMA kernel; the tile kernel only gets quantized K/V for D % 64 != 0.
@@ -137,6 +137,36 @@ Microbenchmark (standalone HIP, 1000-2000 back-to-back launches over 4+ copies o
 - 1 column: +26..37% on the large matrices. A pure read of the same layout (no math) reaches ~950 GB/s and a plain streaming read of a 61 MB buffer ~1000 GB/s per launch on this card, so the S64 GEMV is at ~93% of the access-pattern ceiling.
 - 8 columns are VALU/scalar-load bound in this kernel (but still faster than MMVQ); MMQ-R (or the skinny MFMA kernel from item 2, which this layout also serves) takes over from ~5 columns.
 - Small matrices need the cross-block split: 1024 x 5120 Q5_K is 14.1 us with 4 waves per stripe and 10.0 us with 4 blocks of 4 waves.
+
+### Item 1 status (2026-10-05)
+
+Done behind `GGML_HIP_REPACK=1` (default still off, see "Decision needed" below): the `ROCm0_Repack` buffer type with the S64 layout for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS (matrices with >= 256 rows), and readers for every op that can read such a weight:
+- MMVQ-R (`mmvq-repack.cu`): MUL_MAT up to 4 (Q5_K), 5 (Q4_K, IQ4_XS) or 6 (Q4_0, Q8_0, Q6_K) columns, all columns up to 8 for matrices with < 1024 rows, MUL_MAT_ID up to 8 tokens, gate + GLU and bias fusions. Q4_0/Q8_0 step over groups of 8 blocks (their d values are one 16-byte rest chunk); the full groups have no per-block branches (with them the loads waited: Q4_0 68 -> 57 us). Split K over blocks (last-block fixup in a fixed order) only for fewer than nsm/4 tiles; more blocks with fewer waves were slower in the models.
+- MMQ (`mmq-repack.cuh`): tile loaders with lane = row, same shared memory tile as before; MUL_MAT up to the MMQ limit and MUL_MAT_ID above 8 tokens.
+- hipBLAS path: dequantize into f16 through shared memory (lane = row decode, 256-byte row stores). This is 14-22% faster than the to_fp16 kernels of the GGUF layout for the K-quants (Q5_K 17408x5120 at 512 columns 1949 -> 1655 us).
+- GET_ROWS of 2D weights; stripe-aligned views (start on a stripe, end on a stripe or at the end of the matrix).
+- get_tensor returns the GGUF layout (CPU fallback, tests); test-backend-repack checks set -> get bit-exact incl. partial and unaligned writes, views and memset.
+
+test-backend-ops perf, us/run, same case on the default buffer -> repack (17408 x 5120, 1 column): Q5_K 113.6 -> 71.0, Q6_K 109.3 -> 92.8, Q4_K 87.8 -> 58.9, Q8_0 120.9 -> 104.6, Q4_0 71.4 -> 56.9, IQ4_XS 72.2 -> 68.2. MUL_MAT_ID (128 experts, 8 used, 1 token): Q5_K 704 x 2816 21.4 -> 15.1, Q4_0 2816 x 704 22.8 -> 11.8.
+
+llama-bench, interleaved OFF/ON, 2 rounds, `-ngl 99 -fa 1 -r 3`, commit d33d8f8:
+
+| model | pp2 | pp4 | pp8 | pp16 | pp512 | tg128 |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.8-27B Q5_K_S | +20.7% | +29.4% | -1.7% | -1.5% | +8.9% | 31.63 -> 35.52 (+12.3%) |
+| Gemma 4 31B Q5_K_XL | +37.4% | +46.7% | -2.1% | -1.8% | +13.6% | 26.42 -> 31.18 (+18.0%) |
+| Gemma 4 26B-A4B Q5_K_XL | +4.2% | +8.3% | +15.5% | +3.4% | +2.9% | 103.51 -> 107.52 (+3.9%) |
+| Gemma 4 26B-A4B QAT Q4_K_XL | +8.9% | +15.1% | +27.6% | +3.0% | -1.0% | 124.83 -> 132.44 (+6.1%) |
+
+- Correctness: KLD vs OFF (base ub 512, -c 2048, 16 chunks): Qwen3.8-27B ON ub 512 0.000000 (identical f16 weights in hipBLAS), ON ub 4 0.00218 vs OFF ub 4 0.00196 (other summation order); Gemma 4 31B ON ub 512 0.000000, ON ub 4 0.265 vs OFF ub 4 0.270 (the instruct model is far from wikitext, PPL 225). Greedy outputs diverge after 15-45 tokens at low-margin tokens.
+- Load time (mmap, page cache warm): Qwen 1.9-2.3 -> 2.4 s, Gemma 4 31B 2.3 -> 2.9 s, 26B-A4B 1.8 -> 2.2 s, QAT 1.2 -> 1.4 s (upload through a device scratch and the repack kernel, one cudaMalloc per tensor). VRAM: same model buffer size, plus 256 KB of fixup counters per context and a <= 32 MB scratch during set_tensor.
+- MoE decode gains less than the op times suggest: the expert GEMVs are 25-35% of the kernel time and the dense K = 2816 matrices of 26B-A4B are as fast as before.
+
+Remaining gaps:
+- pp8/pp16 of the dense models are 1.5-2% slower: Q5_K/Q4_K MMQ with the repacked tile loader is 3-4% slower than on the GGUF layout (each warp loads the d/scales and qh chunks again; sharing them through shared memory with an extra barrier was 30% slower). 26B-A4B QAT pp512 -1.0% (Q4_0 MMQ, worst on 2816 x 2112).
+- MMVQ-R is 5-20% slower than MMVQ for small matrices that stay in L2 in test-backend-ops (1024 x 5120); not visible end to end.
+- Not repacked: Q3_K, IQ4_NL (1.5% of Qwen3.8-27B), other IQ types, matrices with < 256 rows.
+- Decision needed: switch the default to on (with `GGML_HIP_REPACK=0` to disable)? All tests and KLD gates pass and most cases are faster, but pp8/pp16 of the Q5_K dense models and QAT pp512 are 1-2% slower.
 
 ### Item 2 status (2026-10-04)
 
