@@ -109,6 +109,13 @@ static bool test_tensor(ggml_backend_buffer_type_t buft, ggml_type type, int64_t
         ok = check("memset", t, ref) && ok;
     }
 
+    // memset of the whole tensor, in several chunks for large tensors
+    {
+        ggml_backend_tensor_memset(t, 0xa5, 0, n);
+        memset(ref.data(), 0xa5, n);
+        ok = check("memset all", t, ref) && ok;
+    }
+
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return ok;
@@ -209,7 +216,7 @@ int main() {
             // the repack buffer keeps matrices with fewer than 256 rows in the GGUF layout
             const int64_t shapes[][3] = {
                 { 256,    1, 1}, { 512,   63, 1}, {5120,  256, 1}, {1024,  301, 1}, {2816, 704, 3}, {256, 277, 5},
-                {4096, 1000, 1}, {1536, 4097, 1},
+                {4096, 1000, 1}, {1536, 4097, 1}, {5120, 1500, 1},
             };
             for (ggml_type type : types) {
                 for (const auto & s : shapes) {

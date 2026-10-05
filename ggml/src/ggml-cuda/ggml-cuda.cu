@@ -823,8 +823,16 @@ static void ggml_backend_cuda_repack_buffer_memset_tensor(ggml_backend_buffer_t 
     }
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
     ggml_cuda_set_device(ctx->device);
-    std::vector<uint8_t> tmp(size, value);
-    ggml_cuda_repack_set_tensor(tensor, tmp.data(), offset, size);
+    // in chunks of whole stripes (at least one, up to ~4 MB), the host buffer is filled once
+    const size_t stripe = GGML_CUDA_REPACK_ROWS*tensor->nb[1];
+    const size_t chunk  = std::max<size_t>(1, (4u << 20) / stripe)*stripe;
+    std::vector<uint8_t> tmp(std::min(size, chunk), value);
+    size_t pos = offset;
+    while (pos < offset + size) {
+        const size_t end = std::min(offset + size, (pos/chunk + 1)*chunk);
+        ggml_cuda_repack_set_tensor(tensor, tmp.data(), pos, end - pos);
+        pos = end;
+    }
 }
 
 static void ggml_backend_cuda_repack_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
