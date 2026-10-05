@@ -70,6 +70,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/repack.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -757,6 +758,13 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_cuda_tensor_is_repacked(src) || ggml_cuda_tensor_is_repacked(dst)) {
+        // raw copy only between two repacked tensors of the same type and shape
+        if (!ggml_cuda_tensor_is_repacked(src) || !ggml_cuda_tensor_is_repacked(dst) || src->view_src || dst->view_src ||
+                src->type != dst->type || !ggml_are_same_shape(src, dst)) {
+            return false;
+        }
+    }
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -803,10 +811,80 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .reset           = */ NULL,
 };
 
+// repack buffer: same memory as the cuda buffer, eligible tensors are stored in the repacked layout
+
+static void ggml_backend_cuda_repack_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    if (!ggml_cuda_tensor_is_repacked(tensor)) {
+        ggml_backend_cuda_buffer_memset_tensor(buffer, tensor, value, offset, size);
+        return;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    std::vector<uint8_t> tmp(size, value);
+    ggml_cuda_repack_set_tensor(tensor, tmp.data(), offset, size);
+}
+
+static void ggml_backend_cuda_repack_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (!ggml_cuda_tensor_is_repacked(tensor)) {
+        ggml_backend_cuda_buffer_set_tensor(buffer, tensor, data, offset, size);
+        return;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_repack_set_tensor(tensor, data, offset, size);
+}
+
+static void ggml_backend_cuda_repack_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (!ggml_cuda_tensor_is_repacked(tensor)) {
+        ggml_backend_cuda_buffer_get_tensor(buffer, tensor, data, offset, size);
+        return;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_repack_get_tensor(tensor, data, offset, size);
+}
+
+static void ggml_backend_cuda_repack_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (!ggml_cuda_tensor_is_repacked(tensor)) {
+        ggml_backend_cuda_buffer_set_tensor_2d(buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
+    for (size_t i = 0; i < n_copies; ++i) {
+        ggml_backend_cuda_repack_buffer_set_tensor(buffer, tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size);
+    }
+}
+
+static void ggml_backend_cuda_repack_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (!ggml_cuda_tensor_is_repacked(tensor)) {
+        ggml_backend_cuda_buffer_get_tensor_2d(buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
+    for (size_t i = 0; i < n_copies; ++i) {
+        ggml_backend_cuda_repack_buffer_get_tensor(buffer, tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
+    }
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_repack_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cuda_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_cuda_repack_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_repack_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_repack_buffer_get_tensor,
+    /* .set_tensor_2d   = */ ggml_backend_cuda_repack_buffer_set_tensor_2d,
+    /* .get_tensor_2d   = */ ggml_backend_cuda_repack_buffer_get_tensor_2d,
+    /* .cpy_tensor      = */ ggml_backend_cuda_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cuda_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
 // cuda buffer type
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
+    bool repack = false; // eligible tensors use the repacked layout
 };
 
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -817,6 +895,10 @@ static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_t
 
 static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
+}
+
+bool ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_is_cuda(buft) && ((ggml_backend_cuda_buffer_type_context *) buft->context)->repack;
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -835,7 +917,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
-    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    return ggml_backend_buffer_init(buft, buft_ctx->repack ? ggml_backend_cuda_repack_buffer_interface : ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -898,6 +980,40 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            bufts[i] = {
+                /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_Repack", true},
+            };
+        }
+        initialized = true;
+    }
+
+    return &bufts[device];
+}
+
+// GGML_HIP_REPACK=1 lists the repack buffer type as an extra buffer type of the device.
+static bool ggml_cuda_repack_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_HIP_REPACK");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -2386,6 +2502,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
+    if (ggml_backend_buft_is_cuda_repack(buf->buft)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        buf->iface.set_tensor(buf, tensor, data, offset, size);
+        return;
+    }
+
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -2394,6 +2516,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    if (ggml_backend_buft_is_cuda_repack(buf->buft)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        buf->iface.get_tensor(buf, tensor, data, offset, size);
+        return;
+    }
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
@@ -2431,6 +2559,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     }
 
     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+        return false;
+    }
+
+    if (ggml_cuda_tensor_is_repacked(src) || ggml_cuda_tensor_is_repacked(dst)) {
         return false;
     }
 
@@ -5028,6 +5160,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    // a repacked tensor can only be read by ops that know the layout
+    if (ggml_cuda_tensor_is_repacked(op)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && ggml_cuda_tensor_is_repacked(op->src[i])) {
+            if (!ggml_cuda_repack_supports_op(op)) {
+                return false;
+            }
+            break;
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -5613,8 +5758,20 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    static ggml_backend_buffer_type_t bufts[GGML_CUDA_MAX_DEVICES][2] = {};
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (ggml_cuda_repack_enabled()) {
+        bufts[dev_ctx->device][0] = ggml_backend_cuda_repack_buffer_type(dev_ctx->device);
+    }
+    return bufts[dev_ctx->device];
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *)ggml_backend_cuda_device_get_extra_bufts;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

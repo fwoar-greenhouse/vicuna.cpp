@@ -1194,6 +1194,21 @@ static bool op_filter_entry_matches(std::string_view entry, std::string_view op_
     return std::regex_search(op_name.data(), op_name.data() + op_name.size(), re);
 }
 
+// first extra buffer type of the backend's device, nullptr if none
+static ggml_backend_buffer_type_t get_extra_buft(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return nullptr;
+    }
+    auto fn = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (!fn) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t * bufts = fn(dev);
+    return bufts ? bufts[0] : nullptr;
+}
+
 struct test_case {
     virtual ~test_case() {}
 
@@ -1292,6 +1307,8 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // put the weight tensors into the first extra buffer type of the device (e.g. a repack buffer)
+    virtual bool weights_in_extra_buft() { return false; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1445,12 +1462,30 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
+            if (weights_in_extra_buft()) {
+                ggml_backend_buffer_type_t extra = get_extra_buft(backend1);
+                if (!extra) {
+                    return test_status_t::SKIPPED;
+                }
+                buf_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), extra));
+            } else {
+                buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
+            }
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (weights_in_extra_buft()) {
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    if (!ggml_backend_supports_op(backend1, t)) {
+                        test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                                           false, false, "not supported");
+                        print_test_result_locked(output_printer, result);
+                        return test_status_t::NOT_SUPPORTED;
+                    }
+                }
+            }
         }
 
         // allocate
@@ -1605,12 +1640,26 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
+            if (weights_in_extra_buft()) {
+                ggml_backend_buffer_type_t extra = get_extra_buft(backend);
+                if (!extra) {
+                    return true;
+                }
+                buf_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), extra));
+            } else {
+                buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
+            }
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors\n");
                 return false;
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (weights_in_extra_buft() && !ggml_backend_supports_op(backend, out)) {
+                test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", false, false,
+                                   "not supported");
+                output_printer->print_test_result(result);
+                return true;
+            }
         }
 
         // allocate
@@ -5343,6 +5392,112 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// MUL_MAT / MUL_MAT_ID / GET_ROWS with the weight in the device's extra buffer type (MI100: repacked weights)
+struct test_repack : public test_case {
+    const ggml_op   op;
+    const ggml_type type;
+    const int64_t m;      // rows of the weight (per expert)
+    const int64_t n;      // columns of b, tokens, or rows to get
+    const int64_t k;
+    const int64_t bs;     // MUL_MAT: batch of the weight (3D); MUL_MAT_ID: number of experts
+    const int64_t n_used; // MUL_MAT_ID: experts per token
+    const int64_t v_off;  // MUL_MAT: the weight is a view of rows [v_off, v_off + m) of a weight with m + v_off + v_tail rows
+    const int64_t v_tail;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return std::string("REPACK_") + ggml_op_name(op);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, m, n, k, bs, n_used, v_off, v_tail);
+    }
+
+    double max_nmse_err() override {
+        return op == GGML_OP_GET_ROWS ? 1e-7 : 5e-4;
+    }
+
+    bool use_weight_context() override { return true; }
+    bool weights_in_extra_buft() override { return true; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        if (op == GGML_OP_GET_ROWS) {
+            return 0;
+        }
+        return 2 * m * k * n * (op == GGML_OP_MUL_MAT_ID ? n_used : bs);
+    }
+
+    test_repack(ggml_op op = GGML_OP_MUL_MAT, ggml_type type = GGML_TYPE_Q5_K, int64_t m = 64, int64_t n = 1, int64_t k = 256,
+            int64_t bs = 1, int64_t n_used = 1, int64_t v_off = 0, int64_t v_tail = 0)
+        : op(op), type(type), m(m), n(n), k(k), bs(bs), n_used(n_used), v_off(v_off), v_tail(v_tail) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("needs a weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * out = nullptr;
+        if (op == GGML_OP_MUL_MAT) {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx_weights, type, k, m + v_off + v_tail, bs);
+            ggml_set_name(a, "a");
+            if (v_off != 0 || v_tail != 0) {
+                a = ggml_view_3d(ctx, a, k, m, bs, a->nb[1], a->nb[2], v_off*a->nb[1]);
+                ggml_set_name(a, "view_of_a");
+            }
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, bs);
+            ggml_set_name(b, "b");
+            out = ggml_mul_mat(ctx, a, b);
+        } else if (op == GGML_OP_MUL_MAT_ID) {
+            ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type, k, m, bs);
+            ggml_set_name(as, "as");
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, bs, n);
+            ggml_set_name(ids, "ids");
+            if (n_used != bs) {
+                ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+                ggml_set_name(ids, "view_of_ids");
+            }
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+            ggml_set_name(b, "b");
+            out = ggml_mul_mat_id(ctx, as, b, ids);
+        } else {
+            GGML_ASSERT(op == GGML_OP_GET_ROWS);
+            ggml_tensor * a = ggml_new_tensor_2d(ctx_weights, type, k, m);
+            ggml_set_name(a, "a");
+            ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+            ggml_set_name(rows, "rows");
+            out = ggml_get_rows(ctx, a, rows);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            } else if (op == GGML_OP_GET_ROWS && !ggml_is_view_op(t->op)) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (auto & d : data) {
+                    d = rng() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+        if (op == GGML_OP_MUL_MAT_ID) {
+            init_mul_mat_id_ids(ctx, bs);
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        if (op == GGML_OP_MUL_MAT_ID) {
+            init_mul_mat_id_ids(ctx, bs);
+        }
     }
 };
 
@@ -10284,6 +10439,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    // weights in the extra buffer type of the device (MI100 repack, GGML_HIP_REPACK=1), skipped if there is none
+    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33, 200}) {
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 64,   n, 256));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 165,  n, 2816));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 1024, n, 5120));
+        }
+        for (int n : {1, 2, 4, 8, 16, 64}) {
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 100, n, 512, 3));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 37,  n, 512, 1, 1, 64));      // view to the end
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 128, n, 512, 1, 1, 128, 64)); // view of whole stripes
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 61,  n, 512, 1, 1, 3, 0));    // view not on a stripe
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 136, n, 2816, 8, 2));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 64,  n, 512, 32, 4));
+        }
+        for (int n : {1, 7, 512}) {
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT,    type, 77, n, 768, 1, 1, 0, 0));
+        }
+        test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 1000, 5,   5120));
+        test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 70,   300, 256));
+    }
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -11533,6 +11710,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 16, 512}) {
+            for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}, {6144, 5120}, {1024, 5120}, {21504, 5376}, {5376, 21504}}) {
+                test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, mk[0], n, mk[1]));
+            }
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT_ID, type, 704, n, 2816, 128, 8));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
