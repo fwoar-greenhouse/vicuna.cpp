@@ -13,6 +13,39 @@ struct topk_moe_config {
     bool delayed_softmax;
 };
 
+// __shfl_xor_sync(x, mask, 32) with DPP (mask 1/2) and ds_swizzle (mask 4..16) instead of ds_bpermute
+static __device__ __forceinline__ float topk_shfl_xor(const float x, const int mask) {
+    switch (mask) {
+        case 16: return ggml_cuda_shfl_xor64<16>(x);
+        case  8: return ggml_cuda_shfl_xor64< 8>(x);
+        case  4: return ggml_cuda_shfl_xor64< 4>(x);
+        case  2: return ggml_cuda_shfl_xor64< 2>(x);
+        case  1: return ggml_cuda_shfl_xor64< 1>(x);
+        default: return __shfl_xor_sync(0xFFFFFFFF, x, mask, WARP_SIZE);
+    }
+}
+
+static __device__ __forceinline__ int topk_shfl_xor(const int x, const int mask) {
+    return __float_as_int(topk_shfl_xor(__int_as_float(x), mask));
+}
+
+// same pairs and order as warp_reduce_sum/max
+static __device__ __forceinline__ float topk_warp_reduce_sum(float x) {
+#pragma unroll
+    for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+        x += topk_shfl_xor(x, mask);
+    }
+    return x;
+}
+
+static __device__ __forceinline__ float topk_warp_reduce_max(float x) {
+#pragma unroll
+    for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+        x = fmaxf(x, topk_shfl_xor(x, mask));
+    }
+    return x;
+}
+
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
@@ -27,7 +60,7 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         }
     }
 
-    max_val = warp_reduce_max(max_val);
+    max_val = topk_warp_reduce_max(max_val);
 
     float sum = 0.f;
 
@@ -44,7 +77,7 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         }
     }
 
-    sum = warp_reduce_sum(sum);
+    sum = topk_warp_reduce_sum(sum);
 
     const float inv_sum = 1.0f / sum;
 
@@ -199,9 +232,9 @@ __global__ void topk_moe_cuda(const float *         logits,
 
 #pragma unroll
             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const float val_s  = __shfl_xor_sync(0xFFFFFFFF, max_val_s, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                const float val    = topk_shfl_xor(max_val, mask);
+                const float val_s  = topk_shfl_xor(max_val_s, mask);
+                const int   expert = topk_shfl_xor(max_expert, mask);
                 if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
                     max_val    = val;
                     max_val_s  = val_s;
@@ -224,8 +257,8 @@ __global__ void topk_moe_cuda(const float *         logits,
 
 #pragma unroll
             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                const float val    = topk_shfl_xor(max_val, mask);
+                const int   expert = topk_shfl_xor(max_expert, mask);
                 if (val > max_val || (val == max_val && expert < max_expert)) {
                     max_val    = val;
                     max_expert = expert;
@@ -250,7 +283,7 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 
     if (config.with_norm) {
-        wt_sum              = warp_reduce_sum(wt_sum);
+        wt_sum              = topk_warp_reduce_sum(wt_sum);
         wt_sum              = max(wt_sum, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
 
