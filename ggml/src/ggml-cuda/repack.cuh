@@ -25,6 +25,7 @@ static constexpr __host__ __device__ ggml_cuda_repack_layout ggml_cuda_repack_ge
         case GGML_TYPE_Q4_K: return {144,  9, 0,   0};
         case GGML_TYPE_Q5_K: return {176, 11, 0,   0};
         case GGML_TYPE_Q6_K: return {210, 13, 2, 208};
+        case GGML_TYPE_IQ4_XS: return {136, 8, 8,  0};
         default:             return {  0,  0, 0,   0};
     }
 }
@@ -47,6 +48,23 @@ static __host__ __device__ __forceinline__ int64_t ggml_cuda_repack_rest_offset(
     const int64_t g  = kb / G;
     const int64_t ng = min((int64_t) G, nkb - g*G);
     return (int64_t) L.nchunk*nkb*r*16 + (g*G*r + i*ng + (kb - g*G))*L.rest;
+}
+
+// get_int_from_table_16 for kvalues_iq4nl with the table in the instructions (no loads)
+static __device__ __forceinline__ int2 ggml_cuda_repack_iq4nl_lut(const int q4) {
+    constexpr uint32_t t0 = 0xBFAD9881; // -127, -104, -83, -65
+    constexpr uint32_t t1 = 0xF6EADDCF; //  -49,  -35, -22, -10
+    constexpr uint32_t t2 = 0x26190D01; //    1,   13,  25,  38
+    constexpr uint32_t t3 = 0x71594535; //   53,   69,  89, 113
+    const uint32_t q_even = q4;
+    const uint32_t q_odd  = q4 >> 4;
+    const uint32_t v_even_low  = __builtin_amdgcn_perm(t1, t0, q_even & 0x07070707);
+    const uint32_t v_odd_low   = __builtin_amdgcn_perm(t1, t0, q_odd  & 0x07070707);
+    const uint32_t v_even_high = __builtin_amdgcn_perm(t3, t2, q_even & 0x07070707);
+    const uint32_t v_odd_high  = __builtin_amdgcn_perm(t3, t2, q_odd  & 0x07070707);
+    const uint32_t mask_even = 0x03020100 | ((q_even & 0x08080808) >> 1);
+    const uint32_t mask_odd  = 0x03020100 | ((q_odd  & 0x08080808) >> 1);
+    return make_int2(__builtin_amdgcn_perm(v_even_high, v_even_low, mask_even), __builtin_amdgcn_perm(v_odd_high, v_odd_low, mask_odd));
 }
 
 bool ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_type_t buft);
@@ -75,6 +93,7 @@ static int ggml_cuda_repack_mmvq_max_cols(const ggml_type type) {
         case GGML_TYPE_Q4_K: return 5;
         case GGML_TYPE_Q5_K: return 4;
         case GGML_TYPE_Q6_K: return 6;
+        case GGML_TYPE_IQ4_XS: return 5;
         default:             return GGML_CUDA_REPACK_MMVQ_MAX_COLS;
     }
 }

@@ -208,6 +208,10 @@ static __device__ __forceinline__ void repack_load_block(const char * sx, const 
     }
     if constexpr (L.rest == 2) {
         blk[4*L.nchunk] = *(const uint16_t *) (sx + ggml_cuda_repack_rest_offset(L, kb, i, r, nkb));
+    } else if constexpr (L.rest == 8) {
+        const int2 t = *(const int2 *) (sx + ggml_cuda_repack_rest_offset(L, kb, i, r, nkb));
+        blk[4*L.nchunk + 0] = t.x;
+        blk[4*L.nchunk + 1] = t.y;
     }
 }
 
@@ -242,6 +246,26 @@ static __device__ __forceinline__ void repack_dequant_block(const int * blk, con
                 v[l] *= d;
             }
             out(j, v);
+        }
+    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+        // as dequantize_iq4_xs; blk = 128 qs bytes, then d, scales_h, scales_l
+        const uint8_t * qs = (const uint8_t *) blk;
+        const float    dall     = __half2float(__ushort_as_half((uint16_t) blk[32]));
+        const uint32_t scales_h = (uint32_t) blk[32] >> 16;
+        const uint32_t scales_l = blk[33];
+#pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            const float d = dall * ((int) (((scales_l >> (4*ib)) & 0xf) | (((scales_h >> (2*ib)) & 3) << 4)) - 32);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float v[8];
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int e = 8*j + l;
+                    v[l] = d * kvalues_iq4nl[e < 16 ? qs[16*ib + e] & 0xf : qs[16*ib + e - 16] >> 4];
+                }
+                out(4*ib + j, v);
+            }
         }
     } else if constexpr (type == GGML_TYPE_Q4_K) {
         const block_q4_K * b = (const block_q4_K *) blk;
@@ -412,6 +436,9 @@ void ggml_cuda_repack_dequantize_f16(const ggml_tensor * src0, half * dst, cudaS
         case GGML_TYPE_Q6_K:
             k_dequant_repack_f16<GGML_TYPE_Q6_K><<<grid, block, 0, stream>>>(x, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
             break;
+        case GGML_TYPE_IQ4_XS:
+            k_dequant_repack_f16<GGML_TYPE_IQ4_XS><<<grid, block, 0, stream>>>(x, dst, nkb, src0->ne[1], src0->ne[2], src0->nb[2], src0->nb[3]);
+            break;
         default:
             GGML_ABORT("unsupported repack type %s", ggml_type_name(src0->type));
     }
@@ -464,6 +491,10 @@ void ggml_cuda_repack_get_rows(const ggml_tensor * src0, const ggml_tensor * src
             break;
         case GGML_TYPE_Q6_K:
             k_get_rows_repack<GGML_TYPE_Q6_K><<<nids, 64, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data,
+                (float *) dst->data, nkb, src0->ne[1], 1, stride_dst);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            k_get_rows_repack<GGML_TYPE_IQ4_XS><<<nids, 64, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data,
                 (float *) dst->data, nkb, src0->ne[1], 1, stride_dst);
             break;
         default:

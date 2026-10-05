@@ -143,6 +143,38 @@ template <ggml_type type, int J, bool fallback, bool store> static __device__ __
                     x_df[i*sram_stride + 2*p + b] = d[b];
                 }
             }
+        } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+            // part p: sub-blocks 2p and 2p+1 = chunks 2p and 2p+1, d*(ls - 32) from the rest
+            float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+            const int p = part;
+            const int4 q0 = mmq_ld4<store>(xr, ir, chunk(2*p + 0));
+            const int4 q1 = mmq_ld4<store>(xr, ir, chunk(2*p + 1));
+            const char * rp = sx + ggml_cuda_repack_rest_offset(L, kb, row, r, nkb);
+            const int m0 = MMQ_LD(((const int *) rp)[0]);
+            const int m1 = MMQ_LD(((const int *) rp)[1]);
+
+            if constexpr (store) {
+                const int qs[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+                const float    d        = __half2float(__ushort_as_half((uint16_t) m0));
+                const uint32_t scales_h = (uint32_t) m0 >> 16;
+                const uint32_t scales_l = m1;
+#pragma unroll
+                for (int l = 0; l < 2; ++l) {
+                    const int ib = 2*p + l;
+                    int v[8];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int2 t = ggml_cuda_repack_iq4nl_lut(qs[4*l + j]);
+                        v[j + 0] = t.x;
+                        v[j + 4] = t.y;
+                    }
+                    int4 * dst = (int4 *) (x_qs + i*sram_stride + 8*ib);
+                    dst[0] = make_int4(v[0], v[1], v[2], v[3]);
+                    dst[1] = make_int4(v[4], v[5], v[6], v[7]);
+                    const int ls = ((scales_l >> (4*ib)) & 0x0F) | (((scales_h >> (2*ib)) & 0x03) << 4);
+                    x_df[i*sram_stride + ib] = d * (ls - 32);
+                }
+            }
         } else if constexpr (type == GGML_TYPE_Q5_K) {
             // part p: sub-blocks 2p and 2p+1, their d*sc and -dmin*m
             half2 * x_dm = (half2 *) (x_qs + MMQ_TILE_NE_K*2);
