@@ -16,3 +16,11 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// Two mat-vecs with few rows and the same src1 in one launch, with epilogues:
+// dst_a = op_a(src0_a*src1 + bias_a) * scale_a (bias_a, scale_a: one value per row), dst_b = op_b(src0_b*src1).
+bool ggml_cuda_mul_mat_vec_q_pair_supported(const ggml_tensor * mm_a, const ggml_tensor * mm_b);
+
+void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
+        float * dst_a, int64_t stride_col_dst_a, const float * bias_a, const float * scale_a, ggml_unary_op op_a,
+        float * dst_b, int64_t stride_col_dst_b, ggml_unary_op op_b);

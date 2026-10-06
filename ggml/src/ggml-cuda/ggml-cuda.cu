@@ -3668,6 +3668,81 @@ static int ggml_cuda_try_concat_cpy_fusion(ggml_backend_cuda_context & ctx, ggml
     return last - i;
 }
 
+// MUL_MAT a -> ADD (one row) -> UNARY -> MUL (one row), then MUL_MAT b with the same src1 -> UNARY (views between):
+// both small mat-vecs and their epilogues in one kernel (the gated delta net gate and beta). Returns the nodes to skip.
+static int ggml_cuda_try_mul_mat_vec_q_pair_fusion(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * mm_a = cgraph->nodes[i];
+    if (mm_a->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE || mm_a->src[0]->ne[1] > 256) {
+        return 0;
+    }
+
+    // the next 5 nodes that are not views
+    int idx[5];
+    int n = 0;
+    for (int j = i + 1; j < cgraph->n_nodes && n < 5; ++j) {
+        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            idx[n++] = j;
+        }
+    }
+    if (n < 5) {
+        return 0;
+    }
+    ggml_tensor * add  = cgraph->nodes[idx[0]];
+    ggml_tensor * ua   = cgraph->nodes[idx[1]];
+    ggml_tensor * mul  = cgraph->nodes[idx[2]];
+    ggml_tensor * mm_b = cgraph->nodes[idx[3]];
+    ggml_tensor * ub   = cgraph->nodes[idx[4]];
+    if (add->op != GGML_OP_ADD || ua->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL || mm_b->op != GGML_OP_MUL_MAT ||
+        ub->op != GGML_OP_UNARY || !ggml_cuda_should_fuse_add_unary_mul(add, ua, mul) ||
+        !ggml_cuda_mul_mat_vec_q_pair_supported(mm_a, mm_b)) {
+        return 0;
+    }
+    const ggml_unary_op op_b = ggml_get_unary_op(ub);
+    if (op_b != GGML_UNARY_OP_SIGMOID && op_b != GGML_UNARY_OP_SOFTPLUS && op_b != GGML_UNARY_OP_SILU) {
+        return 0;
+    }
+
+    // ADD of a view of mm_a and one row, MUL by one row, UNARY b of a view of mm_b; all f32 and contiguous
+    const int64_t rows_a = mm_a->ne[0];
+    const int64_t rows_b = mm_b->ne[0];
+    const ggml_tensor * xa   = add->src[0]->view_src == mm_a ? add->src[0] : add->src[1];
+    const ggml_tensor * bias = xa == add->src[0] ? add->src[1] : add->src[0];
+    const ggml_tensor * scale = mul->src[0] == ua ? mul->src[1] : mul->src[0];
+    if (xa->view_src != mm_a || xa->data != mm_a->data || !ggml_is_contiguous(xa) || !ggml_is_contiguous(mm_a) ||
+        ggml_nelements(bias) != rows_a || ggml_nelements(scale) != rows_a || bias->ne[0] != rows_a || scale->ne[0] != rows_a ||
+        ub->src[0]->view_src != mm_b || ub->src[0]->data != mm_b->data || !ggml_is_contiguous(ub->src[0]) ||
+        !ggml_is_contiguous(mm_b) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(ub) ||
+        ub->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return 0;
+    }
+
+    // the intermediate results must not be used outside of the fused nodes
+    const int last = idx[4];
+    int node_idxs[32];
+    enum ggml_op ops[32];
+    int outputs[32];
+    int n_out = 0;
+    if (last - i + 1 > 32) {
+        return 0;
+    }
+    for (int j = i; j <= last; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        node_idxs[j - i] = j;
+        ops[j - i] = t->op;
+        if (t == mul || t == ub || (t->view_src && (t->view_src == mul || t->view_src == ub))) {
+            outputs[n_out++] = j;
+        }
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, node_idxs, last - i + 1, ops, outputs, n_out)) {
+        return 0;
+    }
+
+    ggml_cuda_mul_mat_vec_q_pair(ctx, mm_a, mm_b,
+        (float *) mul->data, rows_a, (const float *) bias->data, (const float *) scale->data, ggml_get_unary_op(ua),
+        (float *) ub->data, rows_b, op_b);
+    return last - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3700,6 +3775,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int nodes_to_skip = ggml_cuda_try_mul_mat_vec_q_pair_fusion(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
     }

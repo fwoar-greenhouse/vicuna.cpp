@@ -1157,3 +1157,173 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
+
+// Two small mat-vecs with the same src1 in one launch, each with an elementwise epilogue:
+//   dst_a = op_a(x_a*y + bias_a) * scale_a, dst_b = op_b(x_b*y) (e.g. the gated delta net gate and beta).
+// One row per block, the K loop and the reduction are the same as the narrow mul_mat_vec_q.
+
+static __device__ __forceinline__ float mmvq_pair_unary(const int op, const float x) {
+    switch (op) {
+        case GGML_UNARY_OP_SOFTPLUS: return (x > 20.0f) ? x : logf(1.0f + expf(x)); // same as unary.cu
+        case GGML_UNARY_OP_SIGMOID:  return 1.0f / (1.0f + expf(-x));
+        case GGML_UNARY_OP_SILU:     return ggml_cuda_op_silu_single(x);
+        default:                     return x;
+    }
+}
+
+template <ggml_type type, int ncols_dst>
+__launch_bounds__(calc_nwarps(ncols_dst, get_device_table_id(), false, true)*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_pair(
+        const void * __restrict__ vx_a, const void * __restrict__ vx_b, const void * __restrict__ vy,
+        float * __restrict__ dst_a, float * __restrict__ dst_b, const float * __restrict__ bias_a, const float * __restrict__ scale_a,
+        const int op_a, const int op_b, const int nrows_a, const int ncols_x, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst_a, const int stride_col_dst_b) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps    = calc_nwarps(ncols_dst, table_id, false, true);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int  tid  = warp_size*threadIdx.y + threadIdx.x;
+    const bool is_b = (int) blockIdx.x >= nrows_a;
+    const int  row  = is_b ? blockIdx.x - nrows_a : blockIdx.x;
+    const void * GGML_CUDA_RESTRICT vx = is_b ? vx_b : vx_a;
+
+    const int     blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter  = vdr * nwarps*warp_size / qi;
+
+    float tmp[ncols_dst] = { 0.0f };
+
+    const block_q8_1 * GGML_CUDA_RESTRICT y = (const block_q8_1 *) vy;
+    const int kbx_offset = row*stride_row_x;
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp[j] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + kbx, kqs);
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1][ncols_dst][warp_size];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            tmp_shared[threadIdx.y-1][j][threadIdx.x] = tmp[j];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int l = 0; l < nwarps-1; ++l) {
+            tmp[j] += tmp_shared[l][j][threadIdx.x];
+        }
+        tmp[j] = mmvq_warp_reduce_sum(tmp[j]);
+
+        if (threadIdx.x == 0) {
+            if (is_b) {
+                dst_b[j*stride_col_dst_b + row] = mmvq_pair_unary(op_b, tmp[j]);
+            } else {
+                dst_a[j*stride_col_dst_a + row] = mmvq_pair_unary(op_a, tmp[j] + bias_a[row]) * scale_a[row];
+            }
+        }
+    }
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_pair_switch_ncols(
+        const void * vx_a, const void * vx_b, const void * vy, float * dst_a, float * dst_b,
+        const float * bias_a, const float * scale_a, const int op_a, const int op_b,
+        const int nrows_a, const int nrows_b, const int ncols_x, const int ncols_dst, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst_a, const int stride_col_dst_b, cudaStream_t stream) {
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const dim3 block_nums(nrows_a + nrows_b, 1, 1);
+    const dim3 block_dims(warp_size, calc_nwarps(ncols_dst, MMVQ_PARAMETERS_GCN, false, true), 1);
+    switch (ncols_dst) {
+#define MMVQ_PAIR_CASE(n) \
+        case n: \
+            mul_mat_vec_q_pair<type, n><<<block_nums, block_dims, 0, stream>>>(vx_a, vx_b, vy, dst_a, dst_b, bias_a, scale_a, \
+                op_a, op_b, nrows_a, ncols_x, stride_row_x, stride_col_y, stride_col_dst_a, stride_col_dst_b); \
+            break;
+        MMVQ_PAIR_CASE(1) MMVQ_PAIR_CASE(2) MMVQ_PAIR_CASE(3) MMVQ_PAIR_CASE(4)
+#undef MMVQ_PAIR_CASE
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
+bool ggml_cuda_mul_mat_vec_q_pair_supported(const ggml_tensor * mm_a, const ggml_tensor * mm_b) {
+    const ggml_tensor * x_a = mm_a->src[0];
+    const ggml_tensor * x_b = mm_b->src[0];
+    const ggml_tensor * y   = mm_a->src[1];
+    switch (x_a->type) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+    // few rows: the narrow mul_mat_vec_q config, one row per block; up to 4 columns, with more the
+    // compiler serializes the loads per column and two separate launches are faster
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    return x_b->type == x_a->type && mm_b->src[1] == y && x_a->ne[0] == x_b->ne[0] &&
+        x_a->ne[1] + x_b->ne[1] <= nsm && ggml_is_contiguous(x_a) && ggml_is_contiguous(x_b) &&
+        ggml_nrows(x_a) == x_a->ne[1] && ggml_nrows(x_b) == x_b->ne[1] &&
+        !ggml_cuda_tensor_is_repacked(x_a) && !ggml_cuda_tensor_is_repacked(x_b) &&
+        ggml_backend_buffer_get_usage(x_a->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_backend_buffer_get_usage(x_b->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        y->type == GGML_TYPE_F32 && y->nb[0] == sizeof(float) && y->ne[1] >= 1 && y->ne[1] <= 4 &&
+        y->ne[2] == 1 && y->ne[3] == 1 && x_a->ne[0] % ggml_blck_size(x_a->type) == 0 &&
+        mm_a->nb[0] == sizeof(float) && mm_b->nb[0] == sizeof(float);
+}
+
+void ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
+        float * dst_a, const int64_t stride_col_dst_a, const float * bias_a, const float * scale_a, ggml_unary_op op_a,
+        float * dst_b, const int64_t stride_col_dst_b, ggml_unary_op op_b) {
+    const ggml_tensor * x_a = mm_a->src[0];
+    const ggml_tensor * x_b = mm_b->src[0];
+    const ggml_tensor * src1 = mm_a->src[1];
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t nbytes_src1_q8_1 = ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
+    // reuse the q8_1 data of an earlier matmul with the same src1 if there is one
+    void * src1_q8_1 = ctx.q8_1_cache_find(src1);
+    if (src1_q8_1 == nullptr) {
+        src1_q8_1 = ctx.q8_1_cache_alloc(src1, nbytes_src1_q8_1);
+        if (src1_q8_1 == nullptr) {
+            src1_q8_1 = src1_q8_1_local.alloc(nbytes_src1_q8_1);
+        }
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1, x_a->type, ne10, s11, s11*ne11, s11*ne11, ne10_padded,
+            ne11, 1, 1, stream);
+    }
+
+    const int stride_row_x = x_a->nb[1] / ggml_type_size(x_a->type);
+    GGML_ASSERT(x_b->nb[1] == x_a->nb[1]);
+    const int stride_col_y = ne10_padded / QK8_1;
+
+#define MMVQ_PAIR_TYPE(t) \
+    case t: \
+        mul_mat_vec_q_pair_switch_ncols<t>(x_a->data, x_b->data, src1_q8_1, dst_a, dst_b, bias_a, scale_a, op_a, op_b, \
+            x_a->ne[1], x_b->ne[1], ne10, ne11, stride_row_x, stride_col_y, stride_col_dst_a, stride_col_dst_b, stream); \
+        break;
+    switch (x_a->type) {
+        MMVQ_PAIR_TYPE(GGML_TYPE_Q4_0) MMVQ_PAIR_TYPE(GGML_TYPE_Q5_0) MMVQ_PAIR_TYPE(GGML_TYPE_Q8_0)
+        MMVQ_PAIR_TYPE(GGML_TYPE_Q4_K) MMVQ_PAIR_TYPE(GGML_TYPE_Q5_K) MMVQ_PAIR_TYPE(GGML_TYPE_Q6_K)
+        default:
+            GGML_ABORT("fatal error");
+    }
+#undef MMVQ_PAIR_TYPE
+}

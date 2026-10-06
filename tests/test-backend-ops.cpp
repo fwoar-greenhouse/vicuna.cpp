@@ -4655,6 +4655,72 @@ struct test_concat_cpy_ssm_conv : public test_case {
     }
 };
 
+// gated delta net gate and beta: softplus(x*Wa + dt) * A and sigmoid(x*Wb), small mat-vecs with the same x
+// (fused into one kernel in the CUDA backend)
+struct test_mul_mat_pair_gate : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t rows_a;
+    const int64_t rows_b;
+    const int64_t n;
+    const ggml_unary_op op_a;
+    const ggml_unary_op op_b;
+
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_PAIR_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, k, rows_a, rows_b, n) + ",op_a=" + ggml_unary_op_name(op_a) + ",op_b=" + ggml_unary_op_name(op_b);
+    }
+
+    test_mul_mat_pair_gate(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 5120, int64_t rows_a = 48, int64_t rows_b = 48, int64_t n = 4,
+            ggml_unary_op op_a = GGML_UNARY_OP_SOFTPLUS, ggml_unary_op op_b = GGML_UNARY_OP_SIGMOID)
+        : type(type), k(k), rows_a(rows_a), rows_b(rows_b), n(n), op_a(op_a), op_b(op_b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        outs.clear();
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, type, k, rows_a);
+        ggml_set_name(wa, "wa");
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, type, k, rows_b);
+        ggml_set_name(wb, "wb");
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rows_a);
+        ggml_set_name(dt, "dt");
+        ggml_tensor * A = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rows_a);
+        ggml_set_name(A, "A");
+
+        ggml_tensor * a = ggml_mul_mat(ctx, wa, x);
+        a = ggml_reshape_3d(ctx, a, rows_a, n, 1);
+        a = ggml_add(ctx, a, dt);
+        a = ggml_unary(ctx, a, op_a);
+        a = ggml_mul(ctx, a, A);
+        ggml_set_name(a, "gate");
+        a = ggml_reshape_4d(ctx, a, 1, rows_a, n, 1);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, a);
+        }
+        outs.push_back(a);
+
+        ggml_tensor * b = ggml_mul_mat(ctx, wb, x);
+        b = ggml_reshape_4d(ctx, b, 1, rows_b, n, 1);
+        b = ggml_unary(ctx, b, op_b);
+        ggml_set_name(b, "beta");
+        outs.push_back(b);
+        return b;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -10517,6 +10583,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // gated delta net gate and beta mat-vecs with epilogues (fused in CUDA)
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0}) {
+        for (int64_t n : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_pair_gate(type, 1024, 48, 48, n));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_pair_gate(GGML_TYPE_Q8_0, 512, 32, 16, 3, GGML_UNARY_OP_SILU, GGML_UNARY_OP_SOFTPLUS));
+    test_cases.emplace_back(new test_mul_mat_pair_gate(GGML_TYPE_Q5_K, 768, 16, 24, 2, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU));
+    test_cases.emplace_back(new test_mul_mat_pair_gate(GGML_TYPE_Q8_0, 1024, 48, 48, 5)); // too many columns, not fused
+    test_cases.emplace_back(new test_mul_mat_pair_gate(GGML_TYPE_F16, 1024, 48, 48, 4));  // not fused
 
     // concat + conv state copies (fused in CUDA for few tokens) + ssm_conv (+ silu)
     for (int64_t n_t : {1, 4, 9}) {
