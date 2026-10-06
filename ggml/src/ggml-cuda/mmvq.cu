@@ -1028,7 +1028,8 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // the repacked GEMV takes a bias with the shape of the result for any number of columns
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (ggml_cuda_tensor_is_repacked(src0) && fusion->gate == nullptr));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);

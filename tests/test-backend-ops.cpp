@@ -7615,6 +7615,56 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// MUL_MAT with weights in the extra buffer type (repack) + ADD of a tensor with the shape of the result (residual),
+// optionally with a reshape between (fused into the GEMV in the CUDA backend)
+struct test_repack_mul_mat_add : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool reshape;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "REPACK_MUL_MAT_ADD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, n, k, reshape);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    bool weights_in_extra_buft() override { return true; }
+
+    test_repack_mul_mat_add(ggml_type type = GGML_TYPE_Q5_K, int64_t m = 512, int64_t n = 4, int64_t k = 1024, bool reshape = false)
+        : type(type), m(m), n(n), k(k), reshape(reshape) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("needs a weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_weights, type, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * r = reshape ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n, 1) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_set_name(r, "r");
+
+        ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+        if (reshape) {
+            y = ggml_reshape_3d(ctx, y, m, n, 1);
+        }
+        ggml_tensor * out = ggml_add(ctx, y, r);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10718,6 +10768,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 256, 300, 512, 2, 1, 0, 0, GGML_PREC_F32, 1e5f));
         test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 1000, 5,   5120));
         test_cases.emplace_back(new test_repack(GGML_OP_GET_ROWS, type, 300,  300, 256));
+    }
+    // repacked GEMV + add of the residual, fused for 2+ columns
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        for (int n : {1, 2, 4, 6, 8, 9}) {
+            test_cases.emplace_back(new test_repack_mul_mat_add(type, 512, n, 1024, false));
+            test_cases.emplace_back(new test_repack_mul_mat_add(type, 300, n, 2816, true));
+        }
     }
     // Q4_0/Q8_0 with K % 256 != 0: the last group of 8 blocks is partial (MoE down projections, K = 704)
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
