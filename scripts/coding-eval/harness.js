@@ -19,7 +19,7 @@ const HERE = new URL(".", import.meta.url).pathname;
 
 function parseArgs(argv) {
     const opts = {
-        runs: 3, mode: "both", out: "results", maxTokens: 16384, maxSteps: 12, sandboxTimeoutMs: 20000,
+        runs: 3, mode: "both", out: "results", maxTokens: 65536, maxSteps: 12, sandboxTimeoutMs: 20000,
         requestTimeoutS: 1800, parallel: 1, temperature: undefined, topP: undefined,
     };
     const flags = new Set(["self-check", "help", "resume"]);
@@ -70,7 +70,7 @@ const USAGE = `usage: run.sh --endpoint URL --model ID [options]
   --top-k N             top-k (default: server default)
   --reasoning-effort E  low, medium or high (default: server default)
   --resume              keep finished attempts in the label directory and run only the missing ones
-  --max-tokens N        max tokens per reply (default: 16384)
+  --max-tokens N        max tokens per reply (default: 65536)
   --max-steps N         max model calls per agentic phase (default: 12)
   --parallel N          attempts in flight at once (default: 1)
   --self-check          check the problems against their reference solutions; no API calls`;
