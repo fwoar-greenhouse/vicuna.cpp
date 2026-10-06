@@ -22,7 +22,7 @@ function parseArgs(argv) {
         runs: 3, mode: "both", out: "results", maxTokens: 16384, maxSteps: 12, sandboxTimeoutMs: 20000,
         requestTimeoutS: 1800, parallel: 1, temperature: undefined, topP: undefined,
     };
-    const flags = new Set(["self-check", "help"]);
+    const flags = new Set(["self-check", "help", "resume"]);
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (!a.startsWith("--")) throw new Error(`unexpected argument ${a}`);
@@ -41,6 +41,8 @@ function parseArgs(argv) {
             case "problems": opts.problems = v.split(",").map((s) => s.trim()).filter(Boolean); break;
             case "temperature": opts.temperature = parseFloat(v); break;
             case "top-p": opts.topP = parseFloat(v); break;
+            case "top-k": opts.topK = parseInt(v, 10); break;
+            case "reasoning-effort": opts.reasoningEffort = v; break;
             case "max-tokens": opts.maxTokens = parseInt(v, 10); break;
             case "max-steps": opts.maxSteps = parseInt(v, 10); break;
             case "parallel": opts.parallel = parseInt(v, 10); break;
@@ -65,6 +67,9 @@ const USAGE = `usage: run.sh --endpoint URL --model ID [options]
   --problems a,b        only these problem ids (default: all)
   --temperature X       sampling temperature (default: server default)
   --top-p X             top-p (default: server default)
+  --top-k N             top-k (default: server default)
+  --reasoning-effort E  low, medium or high (default: server default)
+  --resume              keep finished attempts in the label directory and run only the missing ones
   --max-tokens N        max tokens per reply (default: 16384)
   --max-steps N         max model calls per agentic phase (default: 12)
   --parallel N          attempts in flight at once (default: 1)
@@ -171,6 +176,12 @@ async function chat(opts, messages, tools) {
     const body = { model: opts.model, messages, max_tokens: opts.maxTokens };
     if (opts.temperature !== undefined) body.temperature = opts.temperature;
     if (opts.topP !== undefined) body.top_p = opts.topP;
+    if (opts.topK !== undefined) body.top_k = opts.topK;
+    if (opts.reasoningEffort !== undefined) {
+        // OpenAI-style field (llama-server) and the OpenRouter form.
+        body.reasoning_effort = opts.reasoningEffort;
+        body.reasoning = { effort: opts.reasoningEffort };
+    }
     if (tools) { body.tools = tools; body.tool_choice = "auto"; }
     const headers = { "Content-Type": "application/json" };
     if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
@@ -546,6 +557,23 @@ async function selfCheck(opts, problems) {
     return bad;
 }
 
+function rowFromResult(problem, mode, run, r) {
+    const st = r.stats ?? {};
+    return {
+        problem, mode, run, ok: r.hidden.ok, passed: r.hidden.passed, total: r.hidden.total,
+        tps: st.predictedMs ? st.predictedN / (st.predictedMs / 1000) : null,
+        note: mode === "agentic" && r.testsVsReference && !r.testsVsReference.ok ? "own tests reject the reference" : null,
+    };
+}
+
+async function readResult(dir) {
+    try {
+        return JSON.parse(await Deno.readTextFile(`${dir}/result.json`));
+    } catch {
+        return null;
+    }
+}
+
 async function main() {
     const opts = parseArgs(Deno.args);
     if (opts.help) { console.log(USAGE); return 0; }
@@ -561,7 +589,7 @@ async function main() {
     await Deno.mkdir(root, { recursive: true });
     const meta = {
         endpoint: opts.endpoint, model: opts.model, started, runs: opts.runs, mode: opts.mode,
-        temperature: opts.temperature ?? null, topP: opts.topP ?? null, maxTokens: opts.maxTokens, maxSteps: opts.maxSteps,
+        temperature: opts.temperature ?? null, topP: opts.topP ?? null, topK: opts.topK ?? null, reasoningEffort: opts.reasoningEffort ?? null, maxTokens: opts.maxTokens, maxSteps: opts.maxSteps,
         problems: problems.map((p) => p.id), sandbox: opts.bwrap && opts.bwrap !== "none" ? "deno (no permissions) under bubblewrap" : "deno (no permissions)",
     };
     await Deno.writeTextFile(`${root}/meta.json`, JSON.stringify(meta, null, 2));
@@ -571,22 +599,31 @@ async function main() {
     for (const p of problems) for (const mode of modes) for (let run = 1; run <= opts.runs; run++) jobs.push({ p, mode, run });
 
     const rows = [];
+    const writeSummary = async () => {
+        rows.sort((a, b) => a.problem.localeCompare(b.problem) || a.mode.localeCompare(b.mode) || a.run - b.run);
+        await Deno.writeTextFile(`${root}/summary.json`, JSON.stringify({ meta, rows }, null, 2));
+        await Deno.writeTextFile(`${root}/summary.md`, summaryMarkdown(meta, rows));
+    };
+    const todo = [];
+    for (const job of jobs) {
+        const prev = opts.resume ? await readResult(`${root}/${job.p.id}/${job.mode}/run-${job.run}`) : null;
+        if (prev) rows.push(rowFromResult(job.p.id, job.mode, job.run, prev));
+        else todo.push(job);
+    }
+    if (opts.resume) console.log(`resume: ${rows.length} attempts already done, ${todo.length} to run`);
+    await writeSummary();
+
     let next = 0;
     async function worker() {
-        while (next < jobs.length) {
-            const { p, mode, run } = jobs[next++];
+        while (next < todo.length) {
+            const { p, mode, run } = todo[next++];
             const dir = `${root}/${p.id}/${mode}/run-${run}`;
             const t0 = performance.now();
             let row;
             try {
                 const att = mode === "plain" ? await plainAttempt(opts, p) : await agenticAttempt(opts, p);
                 await writeAttempt(dir, p, mode, run, att);
-                const st = att.stats;
-                row = {
-                    problem: p.id, mode, run, ok: att.result.hidden.ok, passed: att.result.hidden.passed, total: att.result.hidden.total,
-                    tps: st.predictedMs ? st.predictedN / (st.predictedMs / 1000) : null,
-                    note: mode === "agentic" && att.result.testsVsReference && !att.result.testsVsReference.ok ? "own tests reject the reference" : null,
-                };
+                row = rowFromResult(p.id, mode, run, { ...att.result, stats: att.stats });
             } catch (e) {
                 await Deno.mkdir(dir, { recursive: true });
                 await Deno.writeTextFile(`${dir}/error.txt`, String(e?.stack ?? e));
@@ -595,9 +632,7 @@ async function main() {
             rows.push(row);
             const secs = ((performance.now() - t0) / 1000).toFixed(0);
             console.log(`${row.ok ? "PASS" : row.error ? "ERR " : "fail"} ${p.id} ${mode} run ${run}: ${row.error ? row.error.slice(0, 200) : `${row.passed}/${row.total}`} (${secs} s)`);
-            rows.sort((a, b) => a.problem.localeCompare(b.problem) || a.mode.localeCompare(b.mode) || a.run - b.run);
-            await Deno.writeTextFile(`${root}/summary.json`, JSON.stringify({ meta, rows }, null, 2));
-            await Deno.writeTextFile(`${root}/summary.md`, summaryMarkdown(meta, rows));
+            await writeSummary();
         }
     }
     await Promise.all(Array.from({ length: Math.max(1, opts.parallel) }, worker));
