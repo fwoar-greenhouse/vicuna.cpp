@@ -364,6 +364,53 @@ Tried without gain:
 
 Remaining gap to 44.7 ms per cycle (3 drafted tokens): ~5.4 ms. Candidates: the 4-column GEMV (22.4 ms, ~755 GB/s vs ~870 at 1 column; a kernel with loads and math overlapped inside the wave needs fewer VGPRs per unit, e.g. half-block units), the 48-row Q8_0 GEMVs (96 x 14 us; split K or one launch for alpha and beta), concat + ssm_conv + conv-state copy in one kernel (~0.6 ms), quantize_q8_1 inside the producers (1.1 ms), the MTP draft (7.6 ms) and host gaps (~3.6 ms).
 
+### Speculative decoding: draft pass, host gaps, small kernels (2026-10-05, adf2910..157fc91)
+
+Where the time of a cycle goes (production command, MTP only, 3 drafted tokens, 76.5k depth, at 04dcaad). Host timestamps in the server loop (temporary instrumentation, steady state, 150-cycle windows) plus kernel traces:
+
+| part of a cycle | ms | notes |
+|---|---:|---|
+| verify: graph launch and input copies (host) | 0.45 | the GPU starts while the host still launches |
+| verify: wait for the GPU | 41.2 | 39.1 ms kernel time + ~2.1 ms between ~2,020 kernels (~1 us each in the HIP graph) |
+| MTP update with the verified tokens (host launch) | 0.24 | its 1.1 ms of GPU work runs while the host samples |
+| target sampling and accept | 0.64 | 0.42 in `common_sampler_sample_and_accept_n` |
+| MTP draft, 3 steps | 7.5 | per step 0.32 launch + 2.18 wait and sampling; GPU 2.19 ms per step |
+| server queue between cycles | 0.002 | |
+
+- Host gaps (~3.6 ms = cycle - kernel time) are mostly launch gaps inside the verify graph (~2.1 ms, proportional to the kernel count), then the draft steps (~0.3 ms per step: the next step needs the token sampled on the host, so its launch and input copies are not overlapped), then the MTP update and sampling (~0.2 ms not hidden). The server queue (`yield_to_queue`) costs nothing measurable.
+- One draft step (50 kernels, 2.19 ms GPU): output GEMV 248320 x 5120 1.05 ms (bandwidth bound), FA of the MTP layer (f16 K/V, 76.5k) 0.35 ms (~890 GB/s), the MTP layer GEMVs 0.43 ms, top-k 10 with the radix select 0.17 ms in 11 kernels, 4 input copies with a sync round trip each (~0.1 ms before the first kernel).
+- The 4 user inputs of each graph were copied with a backend sync and a blocking copy each (`ggml_backend_sched_compute_splits`), 5 graphs per cycle.
+
+Changes (each measured interleaved against the commit before; llama-bench Qwen3.8-27B, t/s):
+
+| commit | change | launches per verify | effect |
+|---|---|---:|---|
+| adf2910 | concat + the n_rs_seq+1 conv state copies in one kernel | -144 | pp4 +1.2%, tg128 +1.5%; cycle -0.5 ms |
+| 7a9c0c3 | MMVQ for matrices with fewer row blocks than CUs: 8 warps split K (48-row alpha/beta: 4 columns 10.1 -> 5.9 us) | 0 | pp4 +1.0%, pp8 +1.4% |
+| d7e9db6 | alpha and beta mat-vecs and their epilogues in one kernel (up to 4 columns) | -144 | tg128 +2.4%, pp2 +1.2% |
+| 5191b11 | top-k for k <= 16: per-thread lists and warp merges, 2 kernels (k=10 over 200k: 133 -> 33 us) | | draft 7.52 -> 7.14 ms |
+| 3e4c4c3 | residual add fused into the repacked GEMV for 2-8 columns | -128 | pp2 +3.6%, pp4 +0.8% |
+| 7f8734f | SWIGLU and silu*x write the q8_1 copy for the next repacked GEMV | -111 | pp4 +0.7% |
+| 157fc91 | user inputs copied async in stream order, one event wait after the launch | | launch per graph -0.03..-0.1 ms |
+
+All bit-exact except 7a9c0c3 (other K split, KLD 0.0013 at -ub 4). Gemma 4 31B unchanged by all.
+
+MTP cycle at 76.5k depth, 04dcaad -> 157fc91 (production command with MTP only, 2 interleaved rounds of 2 requests): 3 drafted tokens 50.5 -> 48.6 ms, 2: 45.3 -> 43.8, 1: 37.9 -> 36.3. At the user's mean accepted length of 2.68 the 3-token cycle gives ~55 t/s (was ~53). Per cycle now: verify launch 0.36 + wait 39.8 ms, draft 7.08 ms (0.27 launch + 2.09 per step), sampling 0.67 ms; the verify graph has ~1,500 kernels (was ~2,020), the draft 155 per cycle (was 192).
+
+Tried without gain:
+- concat + conv state copies + ssm_conv in one kernel: the ssm_conv output may get the buffer of the conv state input (it is dead after the concat), so blocks would overwrite the state other blocks still read. The ssm_conv stays a separate kernel.
+- add + rms_norm (+mul) in one kernel (the residual add before the next norm): at 1 row one block does both and is slower than the many-block add (tg128 -0.5%), at 4 rows +0.7%; replaced by the add in the GEMV epilogue (3e4c4c3), which covers the same adds.
+- The alpha/beta kernel for 5-8 columns: the compiler serializes the loads per column (one wait per column, ~2.5 us per column), slower than two launches. The narrow MMVQ kernel with the same loop keeps all loads in flight; restrict, unsigned indices and waves-per-eu attributes did not change the schedule.
+- Top-k with block-level merges or lists of 32: the per-element insert is VALU bound (wave64, 4 cycles per instruction); k > 16 keeps the radix select.
+- MTP KV cache q8_0/q4_0 (`-ctkd q8_0 -ctvd q4_0`, an option, no code change): draft -0.35 ms per cycle at the same acceptance; the f16 FA of the MTP layer is already near bandwidth.
+- Merging the MTP update of the verified tokens with the first draft step (one graph instead of two): estimated ~0.25 ms, since the update already overlaps the host sampling.
+
+Remaining gap to 44.7 ms (3 drafted tokens): ~3.9 ms. Largest levers:
+- FA vector kernel for 4 tokens: 4 Q rows x GQA 6 = 24 columns need 2 passes over K/V (blocks of 16 columns), 330 us per layer at 76.5k vs ~200 us for 1 row; one pass with 32 columns (two MFMA N tiles, VKQ in AGPRs) would save ~1.5-2 ms per verify.
+- The 4-column repacked GEMV (22.5 ms per verify, ~755 GB/s vs ~870 at 1 column).
+- The draft loop on the device (sampled token and embedding feed the next step without the host): ~0.9 ms of launches and round trips.
+- ~1,500 kernels per verify: per GDN layer still get_rows (conv state) + concat/copies + get_rows (ssm state) + ssm_conv + 2 l2 norms, and the attention output gate (strided 3D, not covered by 7f8734f).
+
 ### Benchmark suite
 
 All under `~/.cache/huggingface/hub/`, run with `HIP_VISIBLE_DEVICES=0 llama-bench -ngl 99 -fa 1 -p 2,4,8,16,512 -n 128`:
