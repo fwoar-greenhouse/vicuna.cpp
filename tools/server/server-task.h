@@ -644,6 +644,28 @@ struct server_prompt_cache_state {
     }
 };
 
+// Timings of one prompt cache update: saving the old slot state, loading a cached state for the new
+// prompt, and eviction. Logged by the server so slow updates can be broken down.
+struct server_prompt_cache_timings {
+    double t_size_ms    = 0.0; // llama_state_seq_get_size_ext for target and draft
+    double t_alloc_ms   = 0.0; // cache entry: host vectors, token and checkpoint copies, eviction to make room
+    double t_get_tgt_ms = 0.0; // target state, device to host
+    double t_get_dft_ms = 0.0; // draft state, device to host
+    size_t n_get_tgt    = 0;
+    size_t n_get_dft    = 0;
+    size_t n_ckpt       = 0;   // checkpoints copied into the cache entry
+    size_t n_ckpt_bytes = 0;
+
+    double t_scan_ms    = 0.0; // common prefix search over cached prompts
+    size_t n_scanned    = 0;
+    double t_set_tgt_ms = 0.0; // target state, host to device
+    double t_set_dft_ms = 0.0; // draft state, host to device
+    size_t n_set_tgt    = 0;
+    size_t n_set_dft    = 0;
+
+    double t_update_ms  = 0.0; // eviction after the update
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -664,7 +686,8 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+              server_prompt_cache_timings * tm = nullptr);
 
     void update();
 };

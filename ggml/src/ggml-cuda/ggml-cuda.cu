@@ -374,6 +374,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    size_t pool_size_max = 0;
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
@@ -455,6 +456,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        pool_size_max = std::max(pool_size_max, pool_size);
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -475,6 +477,19 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+    }
+
+    void stats(size_t & reserved, size_t & cached, size_t & high_water, int & n_cached) const override {
+        reserved   = pool_size;
+        high_water = pool_size_max;
+        cached     = 0;
+        n_cached   = 0;
+        for (int i = 0; i < MAX_BUFFERS; ++i) {
+            if (buffer_pool[i].ptr != nullptr) {
+                cached += buffer_pool[i].size;
+                n_cached++;
+            }
+        }
     }
 };
 
@@ -617,6 +632,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+    }
+
+    void stats(size_t & reserved, size_t & cached, size_t & high_water, int & n_cached) const override {
+        // the VMM pool only grows, so its size is also its high-water mark
+        reserved   = pool_size;
+        high_water = pool_size;
+        cached     = pool_size - pool_used;
+        n_cached   = 0;
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -4880,6 +4903,51 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// GGML_HIP_POOL_STATS=<seconds>: every <seconds>, log the device memory use and the memory pools of
+// this backend context. Pools keep freed buffers cached, so this shows where device memory goes.
+static void ggml_cuda_log_pool_stats(ggml_backend_cuda_context * cuda_ctx) {
+    static const int64_t interval_us = [] {
+        const char * env = getenv("GGML_HIP_POOL_STATS");
+        return env ? (int64_t) (atof(env) * 1e6) : (int64_t) 0;
+    }();
+    if (interval_us <= 0) {
+        return;
+    }
+    const int64_t now = ggml_time_us();
+    if (now - cuda_ctx->last_pool_stats_us < interval_us) {
+        return;
+    }
+    cuda_ctx->last_pool_stats_us = now;
+
+    size_t mem_free = 0, mem_total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&mem_free, &mem_total));
+
+    std::string pools;
+    size_t sum_reserved = 0, sum_cached = 0;
+    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+        const auto & pool = cuda_ctx->pools[cuda_ctx->device][s];
+        if (pool == nullptr) {
+            continue;
+        }
+        size_t reserved, cached, high_water;
+        int n_cached;
+        pool->stats(reserved, cached, high_water, n_cached);
+        sum_reserved += reserved;
+        sum_cached   += cached;
+        char buf[160];
+        snprintf(buf, sizeof(buf), " | stream %d: %.1f MiB (max %.1f), %.1f MiB cached in %d buffers",
+                 s, reserved/1048576.0, high_water/1048576.0, cached/1048576.0, n_cached);
+        pools += buf;
+    }
+    size_t n_graphs = 0;
+#ifdef USE_CUDA_GRAPH
+    n_graphs = cuda_ctx->cuda_graphs.size();
+#endif
+    GGML_LOG_INFO("%s: ctx %p device %d: used %.1f of %.1f MiB, pools %.1f MiB (%.1f MiB cached), %zu graphs%s\n",
+                  __func__, (void *) cuda_ctx, cuda_ctx->device, (mem_total - mem_free)/1048576.0, mem_total/1048576.0,
+                  sum_reserved/1048576.0, sum_cached/1048576.0, n_graphs, pools.c_str());
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4935,6 +5003,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    ggml_cuda_log_pool_stats(cuda_ctx);
 
     return GGML_STATUS_SUCCESS;
 }

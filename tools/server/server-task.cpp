@@ -1801,7 +1801,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                               server_prompt_cache_timings * tm) {
+    int64_t t0 = ggml_time_us();
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1832,6 +1834,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             it_best = it;
         }
     }
+    if (tm) {
+        tm->t_scan_ms = (ggml_time_us() - t0) / 1000.0;
+        tm->n_scanned = states.size();
+    }
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
@@ -1840,7 +1846,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             auto & data = it_best->data.main;
 
             const size_t size = data.size();
+            t0 = ggml_time_us();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            if (tm) {
+                tm->t_set_tgt_ms = (ggml_time_us() - t0) / 1000.0;
+                tm->n_set_tgt    = size;
+            }
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
@@ -1858,7 +1869,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 GGML_ASSERT(ctx_dft);
 
                 const size_t size = data.size();
+                t0 = ggml_time_us();
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                if (tm) {
+                    tm->t_set_dft_ms = (ggml_time_us() - t0) / 1000.0;
+                    tm->n_set_dft    = size;
+                }
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 

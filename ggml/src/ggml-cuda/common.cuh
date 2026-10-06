@@ -869,6 +869,13 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // Device memory held by the pool, the part of it not in use, the largest size so far,
+    // and the number of cached buffers. For GGML_HIP_POOL_STATS.
+    virtual void stats(size_t & reserved, size_t & cached, size_t & high_water, int & n_cached) const {
+        reserved = cached = high_water = 0;
+        n_cached = 0;
+    }
 };
 
 template<typename T>
@@ -1122,6 +1129,9 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+    // last GGML_HIP_POOL_STATS log line of this context, in microseconds
+    int64_t last_pool_stats_us = 0;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

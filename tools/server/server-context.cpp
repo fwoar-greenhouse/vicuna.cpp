@@ -284,34 +284,58 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, server_prompt_cache_timings * tm = nullptr) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
 
+        int64_t t0 = ggml_time_us();
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        if (tm) {
+            tm->t_size_ms = (ggml_time_us() - t0) / 1000.0;
+        }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        t0 = ggml_time_us();
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        if (tm) {
+            tm->t_alloc_ms = (ggml_time_us() - t0) / 1000.0;
+        }
         if (cur == nullptr) {
             return false;
         }
+        if (tm) {
+            tm->n_ckpt = cur->prompt.checkpoints.size();
+            for (const auto & ckpt : cur->prompt.checkpoints) {
+                tm->n_ckpt_bytes += ckpt.size();
+            }
+        }
 
+        t0 = ggml_time_us();
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (tm) {
+            tm->t_get_tgt_ms = (ggml_time_us() - t0) / 1000.0;
+            tm->n_get_tgt    = cur_size_tgt;
+        }
         if (ctx_dft) {
+            t0 = ggml_time_us();
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (tm) {
+                tm->t_get_dft_ms = (ggml_time_us() - t0) / 1000.0;
+                tm->n_get_dft    = cur_size_dft;
+            }
         }
 
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, server_prompt_cache_timings * tm = nullptr) {
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, tm);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1699,15 +1723,31 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                server_prompt_cache_timings tm;
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                ret->prompt_save(*prompt_cache, &tm);
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens, &tm)) {
                     ret->prompt_clear();
                 }
 
+                const int64_t t_update = ggml_time_us();
                 prompt_cache->update();
+                tm.t_update_ms = (ggml_time_us() - t_update) / 1000.0;
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+
+                const auto mib  = [](size_t n) { return n / (1024.0 * 1024.0); };
+                const auto gbps = [](size_t n, double ms) { return ms > 0.0 ? n / (ms * 1e6) : 0.0; };
+                SRV_INF("prompt cache update: %.1f ms | save: size %.1f ms, alloc %.1f ms (%zu checkpoints, %.1f MiB), "
+                        "get tgt %.1f ms (%.1f MiB, %.2f GB/s), get dft %.1f ms (%.1f MiB) | load: scan %.1f ms (%zu prompts), "
+                        "set tgt %.1f ms (%.1f MiB, %.2f GB/s), set dft %.1f ms (%.1f MiB) | update %.1f ms\n",
+                        (ggml_time_us() - t_start) / 1000.0,
+                        tm.t_size_ms, tm.t_alloc_ms, tm.n_ckpt, mib(tm.n_ckpt_bytes),
+                        tm.t_get_tgt_ms, mib(tm.n_get_tgt), gbps(tm.n_get_tgt, tm.t_get_tgt_ms), tm.t_get_dft_ms, mib(tm.n_get_dft),
+                        tm.t_scan_ms, tm.n_scanned,
+                        tm.t_set_tgt_ms, mib(tm.n_set_tgt), gbps(tm.n_set_tgt, tm.t_set_tgt_ms), tm.t_set_dft_ms, mib(tm.n_set_dft),
+                        tm.t_update_ms);
             }
         }
 
