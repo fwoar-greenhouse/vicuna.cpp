@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2695,9 +2696,42 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        // Each tensor_get is a synchronous device-to-host copy with a fixed cost of tens of microseconds. A sequence
+        // whose cells are interleaved with another sequence's (unified KV cache, parallel decoding) has thousands of
+        // short cell ranges per layer, so copying them one by one runs far below the bus bandwidth. Instead, ranges of
+        // the same tensor that are close together are read as one span into a staging buffer and scattered on the host.
+        constexpr size_t max_gap = 256*1024;
+
+        std::vector<const write_info *> order;
+        order.reserve(winfos.size());
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            order.push_back(&winfo);
+        }
+        std::sort(order.begin(), order.end(), [](const write_info * a, const write_info * b) {
+            return a->tensor != b->tensor ? a->tensor < b->tensor : a->offset < b->offset;
+        });
+
+        std::vector<uint8_t> staging;
+        for (size_t i = 0; i < order.size(); ) {
+            ggml_tensor * tensor = order[i]->tensor;
+            const size_t  begin  = order[i]->offset;
+            size_t        end    = begin + order[i]->size;
+            size_t        j      = i + 1;
+            while (j < order.size() && order[j]->tensor == tensor && order[j]->offset <= end + max_gap) {
+                end = std::max(end, order[j]->offset + order[j]->size);
+                j++;
+            }
+
+            if (j == i + 1) {
+                ggml_backend_tensor_get(tensor, order[i]->ptr, order[i]->offset, order[i]->size);
+            } else {
+                staging.resize(end - begin);
+                ggml_backend_tensor_get(tensor, staging.data(), begin, end - begin);
+                for (size_t k = i; k < j; ++k) {
+                    memcpy(order[k]->ptr, staging.data() + (order[k]->offset - begin), order[k]->size);
+                }
+            }
+            i = j;
         }
     }
 
