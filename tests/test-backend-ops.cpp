@@ -10803,6 +10803,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    // hipBLAS fallback with src0 big enough to be dequantized in chunks of rows (ggml_cuda_mul_mat_split_rows):
+    // 40050 x 5120 is 391 MiB in f16, two chunks, the last one ends in a partial group of 64 rows
+    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n : {130, 300}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 40050, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_repack(GGML_OP_MUL_MAT, type, 40050, n, 5120));
+        }
+    }
+
     // weights in the extra buffer type of the device (MI100 repack, GGML_HIP_REPACK=1), skipped if there is none.
     // Matrices with fewer than 256 rows are not repacked; odd row counts test the last stripe.
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {

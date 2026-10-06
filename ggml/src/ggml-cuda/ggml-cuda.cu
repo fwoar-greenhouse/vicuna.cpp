@@ -1499,7 +1499,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    // dst may also be a slice of rows of a contiguous 2D matrix, see ggml_cuda_mul_mat_split_rows
+    const bool dst_row_slice = !ggml_is_contiguous(dst);
+    GGML_ASSERT(!dst_row_slice || (dst->nb[0] == sizeof(float) && dst->ne[2] == 1 && dst->ne[3] == 1));
 
     // Byte offsets and tensor dimensions are currently used in an inconsistent way for dst.
     // As long as dst is contiguous this does not matter though.
@@ -1608,6 +1610,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if constexpr (compute_type == GGML_TYPE_F32) {
             dst_ptr = (char *) dst_ddf;  // Direct F32 output
         } else {
+            GGML_ASSERT(!dst_row_slice);
             dst_ptr = (char *) dst_temp.alloc(ne_dst);
             nbd2 /= sizeof(float) / sizeof(cuda_t);
             nbd3 /= sizeof(float) / sizeof(cuda_t);
@@ -1621,6 +1624,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int64_t r2 = ne12/ne02;
     const int64_t r3 = ne13/ne03;
 
+    // leading dimension of dst for the single-matrix GEMMs below
+    const int64_t ldc = dst_row_slice ? (int64_t) (nb1 / sizeof(float)) : ne0;
+    GGML_ASSERT(!dst_row_slice || (ne12 == 1 && ne13 == 1));
+
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
@@ -1630,14 +1637,14 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                     ne01, ne11, ne10,
                     (const float *) alpha, (const float *) src0_ptr, s01,
                                            (const float *) src1_ptr, s11,
-                    (const float *) beta,  (float       *)  dst_ptr, ne0));
+                    (const float *) beta,  (float       *)  dst_ptr, ldc));
     } else if (ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
                     alpha, src0_ptr, cu_data_type_a, s01,
                            src1_ptr, cu_data_type_b, s11,
-                    beta,   dst_ptr, cu_data_type,   ne0,
+                    beta,   dst_ptr, cu_data_type,   ldc,
                     cu_compute_type,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
@@ -1737,7 +1744,48 @@ static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0,
     return compute_type;
 }
 
+// The hipBLAS path dequantizes all of src0 into a pool temporary. For a large matrix, e.g. the output layer of a model
+// with a big vocabulary (248k x 5120 is 2.4 GiB in f16), that buffer stays cached in the pool for the life of the
+// process. Instead, split src0 into chunks of rows that dequantize to at most this many bytes, and write each
+// chunk's result into the matching rows of dst.
+static constexpr size_t GGML_CUDA_DEQUANT_CHUNK_BYTES = 256ull*1024*1024;
+
+template <typename F>
+static bool ggml_cuda_mul_mat_split_rows(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                                         ggml_type compute_type, F && mul_mat) {
+    if (!ggml_is_quantized(src0->type) || compute_type == GGML_TYPE_BF16 || // bf16 output goes through a temporary
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            !ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const size_t row_bytes = src0->ne[0]*ggml_type_size(compute_type);
+    if (src0->ne[1]*row_bytes <= GGML_CUDA_DEQUANT_CHUNK_BYTES) {
+        return false;
+    }
+    // multiple of 64 rows: repacked tensors store rows in groups of GGML_CUDA_REPACK_ROWS
+    const int64_t chunk = std::max<int64_t>(64, (int64_t) (GGML_CUDA_DEQUANT_CHUNK_BYTES / row_bytes) / 64 * 64);
+    for (int64_t r0 = 0; r0 < src0->ne[1]; r0 += chunk) {
+        const int64_t nr = std::min(chunk, src0->ne[1] - r0);
+        ggml_tensor src0_c = *src0;
+        src0_c.ne[1]    = nr;
+        src0_c.nb[2]    = src0_c.nb[1]*nr;
+        src0_c.nb[3]    = src0_c.nb[2];
+        src0_c.data     = (char *) src0->data + r0*src0->nb[1];
+        src0_c.view_src = nullptr;
+        ggml_tensor dst_c = *dst;
+        dst_c.ne[0]    = nr;
+        dst_c.data     = (char *) dst->data + r0*dst->nb[0];
+        dst_c.view_src = nullptr;
+        mul_mat(&src0_c, &dst_c);
+    }
+    return true;
+}
+
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_mul_mat_split_rows(src0, src1, dst, ggml_cuda_mul_mat_cublas_compute_type(src0, dst),
+            [&](const ggml_tensor * src0_c, ggml_tensor * dst_c) { ggml_cuda_mul_mat_cublas(ctx, src0_c, src1, dst_c); })) {
+        return;
+    }
     switch (ggml_cuda_mul_mat_cublas_compute_type(src0, dst)) {
         case GGML_TYPE_F32:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
@@ -1920,6 +1968,10 @@ static void ggml_cuda_mul_mat_repack(ggml_backend_cuda_context & ctx, const ggml
     // dequantize straight into the hipBLAS compute type, an f16 copy could overflow or lose precision
     const ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, dst);
     GGML_ASSERT(compute_type == GGML_TYPE_F16 || compute_type == GGML_TYPE_BF16 || compute_type == GGML_TYPE_F32);
+    if (ggml_cuda_mul_mat_split_rows(src0, src1, dst, compute_type,
+            [&](const ggml_tensor * src0_c, ggml_tensor * dst_c) { ggml_cuda_mul_mat_repack(ctx, src0_c, src1, dst_c); })) {
+        return;
+    }
     const size_t ts = ggml_type_size(compute_type);
     ggml_cuda_pool_alloc<char> src0_dq(ctx.pool(), ggml_nelements(src0)*ts);
     ggml_cuda_repack_dequantize(src0, src0_dq.get(), compute_type, ctx.stream());
