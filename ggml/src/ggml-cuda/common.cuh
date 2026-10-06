@@ -1260,6 +1260,7 @@ struct ggml_backend_cuda_context {
         void *           q8_1   = nullptr;
         size_t           size   = 0;
         int64_t          last_use = 0;
+        const ggml_tensor * producer = nullptr; // node that wrote the q8_1 data together with src1
     };
     static constexpr int Q8_1_CACHE_SIZE = 4;
     q8_1_cache_entry q8_1_cache[Q8_1_CACHE_SIZE];
@@ -1315,8 +1316,9 @@ struct ggml_backend_cuda_context {
         return nullptr;
     }
 
-    // allocates a cache entry for t with nbytes_q8_1 bytes, or returns nullptr if the cache is off
-    void * q8_1_cache_alloc(const ggml_tensor * t, size_t nbytes_q8_1) {
+    // allocates a cache entry for t with nbytes_q8_1 bytes, or returns nullptr if the cache is off.
+    // producer: the node that writes t and the q8_1 data at the same time (its own write does not drop the entry)
+    void * q8_1_cache_alloc(const ggml_tensor * t, size_t nbytes_q8_1, const ggml_tensor * producer = nullptr) {
         if (!q8_1_cache_usable(t)) {
             return nullptr;
         }
@@ -1341,6 +1343,7 @@ struct ggml_backend_cuda_context {
         dst->pool     = &pool();
         dst->q8_1     = dst->pool->alloc(nbytes_q8_1, &dst->size);
         dst->last_use = ++q8_1_cache_clock;
+        dst->producer = producer;
         return dst->q8_1;
     }
 
@@ -1352,7 +1355,7 @@ struct ggml_backend_cuda_context {
         const char * w0 = (const char *) node->data;
         const char * w1 = w0 + ggml_nbytes(node);
         for (q8_1_cache_entry & e : q8_1_cache) {
-            if (e.q8_1 == nullptr) {
+            if (e.q8_1 == nullptr || e.producer == node) {
                 continue;
             }
             const char * r0 = (const char *) e.data;

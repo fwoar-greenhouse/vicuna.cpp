@@ -93,6 +93,11 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// dst = op(x) * g (SILU or SIGMOID, f32) as nrows rows of ne00 values, and its q8_1 copy in the layout of
+// quantize_row_q8_1_cuda; returns false (nothing done) if the shapes are not supported
+bool ggml_cuda_op_unary_gated_q8_1(ggml_backend_cuda_context & ctx, ggml_unary_op op, const ggml_tensor * x, const ggml_tensor * g,
+        ggml_tensor * dst, int64_t ne00, int64_t nrows, void * q8_1, int64_t ne0_padded);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 bool ggml_cuda_should_fuse_add_unary_mul(const ggml_tensor * add_node, const ggml_tensor * unary_node, const ggml_tensor * mul_node);

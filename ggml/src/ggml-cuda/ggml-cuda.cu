@@ -3743,6 +3743,78 @@ static int ggml_cuda_try_mul_mat_vec_q_pair_fusion(ggml_backend_cuda_context & c
     return last - i;
 }
 
+// SWIGLU, or UNARY (silu/sigmoid) -> MUL, whose result is src1 of the next repacked mat-vec (views between):
+// the kernel also writes the q8_1 copy of src1, the mat-vec then finds it in the q8_1 cache.
+// Returns the nodes to skip, -1 if only node i was computed.
+static int ggml_cuda_try_unary_gated_q8_1_fusion(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    const ggml_tensor * x = nullptr;
+    const ggml_tensor * g = nullptr;
+    ggml_tensor * out = nullptr;
+    ggml_unary_op op;
+    int last;
+    if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->src[1] &&
+        ggml_get_op_params_i32(node, 1) == 0) { // not swapped
+        x    = node->src[0];
+        g    = node->src[1];
+        out  = node;
+        op   = GGML_UNARY_OP_SILU;
+        last = i;
+    } else if (node->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes &&
+               (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+                ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }))) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        x    = node->src[0];
+        g    = mul->src[0] == node ? mul->src[1] : mul->src[0];
+        out  = mul;
+        op   = ggml_get_unary_op(node);
+        last = i + 1;
+        if (!ggml_are_same_shape(x, g)) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+
+    // the consumer: the next node that is not a view
+    int j = last + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mm   = cgraph->nodes[j];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || (src1 != out && (src1->view_src != out || src1->data != out->data)) ||
+        !ggml_is_contiguous(src1) || src1->type != GGML_TYPE_F32 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        !ggml_cuda_tensor_is_repacked(mm->src[0]) || src1->ne[1] > ggml_cuda_repack_mmvq_max_cols(mm->src[0]) ||
+        ggml_nelements(src1) != ggml_nelements(out) || !ggml_is_contiguous(out)) {
+        return 0;
+    }
+
+    // q8_1 copy as ggml_cuda_mul_mat_vec_q makes it
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8_1 = src1->ne[1]*ne10_padded*sizeof(block_q8_1)/QK8_1;
+    if (ctx.q8_1_cache_find(src1) != nullptr) {
+        return 0;
+    }
+    void * q8_1 = ctx.q8_1_cache_alloc(src1, nbytes_q8_1, out);
+    if (q8_1 == nullptr) {
+        return 0;
+    }
+    if (!ggml_cuda_op_unary_gated_q8_1(ctx, op, x, g, out, src1->ne[0], src1->ne[1], q8_1, ne10_padded)) {
+        // drop the unused entry
+        for (auto & e : ctx.q8_1_cache) {
+            if (e.q8_1 == q8_1) {
+                ctx.q8_1_cache_drop(e);
+            }
+        }
+        return 0;
+    }
+    return last == i ? -1 : last - i;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3783,6 +3855,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int nodes_to_skip = ggml_cuda_try_mul_mat_vec_q_pair_fusion(*cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_GLU || node->op == GGML_OP_UNARY) {
+        const int ret = ggml_cuda_try_unary_gated_q8_1_fusion(*cuda_ctx, cgraph, i);
+        if (ret != 0) {
+            return ret;
         }
     }
 
@@ -4706,13 +4785,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                // -1: node i was computed by itself (with extra outputs), no node is skipped
+                const int fuse_ret = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                const int nodes_to_skip = fuse_ret < 0 ? 0 : fuse_ret;
 
                 for (int j = i; j <= i + nodes_to_skip; ++j) {
                     cuda_ctx->q8_1_cache_on_write(cgraph->nodes[j]);
                 }
 
-                if (nodes_to_skip != 0) {
+                if (fuse_ret != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",

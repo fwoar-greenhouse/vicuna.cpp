@@ -7665,6 +7665,68 @@ struct test_repack_mul_mat_add : public test_case {
     }
 };
 
+// SWIGLU (or UNARY -> MUL) whose result is src1 of a mat-vec with weights in the extra buffer type (repack);
+// the CUDA backend writes the q8_1 copy of src1 in the gated kernel
+struct test_repack_gated_mul_mat : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int kind; // 0: swiglu, 1: silu * x with a reshape before the mat-vec, 2: sigmoid * x
+
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "REPACK_GATED_MUL_MAT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, n, k, kind);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+    bool use_weight_context() override { return true; }
+    bool weights_in_extra_buft() override { return true; }
+
+    test_repack_gated_mul_mat(ggml_type type = GGML_TYPE_Q5_K, int64_t m = 512, int64_t n = 4, int64_t k = 1024, int kind = 0)
+        : type(type), m(m), n(n), k(k), kind(kind) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("needs a weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        outs.clear();
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_weights, type, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * a = kind == 1 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k/4, 4, n) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = kind == 1 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k/4, 4, n) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * h = nullptr;
+        if (kind == 0) {
+            h = ggml_swiglu_split(ctx, a, b);
+        } else {
+            h = ggml_mul(ctx, ggml_unary(ctx, a, kind == 1 ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_SIGMOID), b);
+        }
+        ggml_set_name(h, "h");
+        outs.push_back(h);
+        if (kind == 1) {
+            h = ggml_reshape_2d(ctx, h, k, n);
+        }
+        ggml_tensor * out = ggml_mul_mat(ctx, w, h);
+        ggml_set_name(out, "out");
+        outs.push_back(out);
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10775,6 +10837,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_repack_mul_mat_add(type, 512, n, 1024, false));
             test_cases.emplace_back(new test_repack_mul_mat_add(type, 300, n, 2816, true));
         }
+    }
+    // gated kernel that writes the q8_1 copy for the repacked GEMV
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {1, 2, 4, 8, 9}) {
+            for (int kind : {0, 1, 2}) {
+                test_cases.emplace_back(new test_repack_gated_mul_mat(type, 512, n, 1024, kind));
+            }
+        }
+        test_cases.emplace_back(new test_repack_gated_mul_mat(type, 300, 3, 1280, 0)); // padded rows of q8_1
     }
     // Q4_0/Q8_0 with K % 256 != 0: the last group of 8 blocks is partial (MoE down projections, K = 704)
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {

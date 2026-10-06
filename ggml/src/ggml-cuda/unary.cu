@@ -1,5 +1,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "quantize.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -804,4 +805,79 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
     } else {
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
+}
+
+/* op(x) * g that also writes the q8_1 copy of the result for a following mat-vec */
+
+// Grid and q8_1 layout as quantize_q8_1 (quantize_row_q8_1_cuda) for 2D tensors, ne0: padded row length.
+template <float (*op)(float)>
+static __global__ void unary_gated_q8_1_kernel(const float * __restrict__ x, const float * __restrict__ g, float * __restrict__ dst,
+        block_q8_1 * __restrict__ y, const int64_t ne00, const int64_t sx, const int64_t sg, const int64_t ne0) {
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i0 >= ne0) {
+        return;
+    }
+    const int64_t i1 = blockIdx.y;
+
+    // same as unary_gated_op_kernel
+    float v = 0.0f;
+    if (i0 < ne00) {
+        v = op(x[i1*sx + i0]) * g[i1*sg + i0];
+        dst[i1*ne00 + i0] = v;
+    }
+
+    // same as quantize_q8_1
+    float amax = fabsf(v);
+    float sum  = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+
+    const int64_t i_cont = i1*ne0 + i0;
+    const int64_t ib     = i_cont / QK8_1;
+    const int64_t iqs    = i_cont % QK8_1;
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
+bool ggml_cuda_op_unary_gated_q8_1(ggml_backend_cuda_context & ctx, ggml_unary_op op, const ggml_tensor * x, const ggml_tensor * g,
+        ggml_tensor * dst, const int64_t ne00, const int64_t nrows, void * q8_1, int64_t ne0_padded) {
+    if (x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        ggml_nelements(dst) != ne00*nrows || ggml_nelements(x) != ne00*nrows || ggml_nelements(g) != ne00*nrows ||
+        ne0_padded % QK8_1 != 0) {
+        return false;
+    }
+    // rows of ne00 values: all contiguous, or 2D tensors with row strides
+    auto row_stride = [&](const ggml_tensor * t, int64_t & s) {
+        if (ggml_is_contiguous(t)) {
+            s = ne00;
+            return true;
+        }
+        s = t->nb[1] / sizeof(float);
+        return t->nb[0] == sizeof(float) && t->ne[0] == ne00 && t->ne[1] == nrows && t->ne[2] == 1 && t->ne[3] == 1;
+    };
+    int64_t sx;
+    int64_t sg;
+    if (!row_stride(x, sx) || !row_stride(g, sg)) {
+        return false;
+    }
+    const dim3 blocks((ne0_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, nrows, 1);
+    cudaStream_t stream = ctx.stream();
+    switch (op) {
+        case GGML_UNARY_OP_SILU:
+            unary_gated_q8_1_kernel<op_silu><<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(
+                (const float *) x->data, (const float *) g->data, (float *) dst->data, (block_q8_1 *) q8_1, ne00, sx, sg, ne0_padded);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            unary_gated_q8_1_kernel<op_sigmoid><<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(
+                (const float *) x->data, (const float *) g->data, (float *) dst->data, (block_q8_1 *) q8_1, ne00, sx, sg, ne0_padded);
+            break;
+        default:
+            return false;
+    }
+    return true;
 }
