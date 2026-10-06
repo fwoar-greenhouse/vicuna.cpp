@@ -185,9 +185,11 @@ async function chat(opts, messages, tools) {
     if (tools) { body.tools = tools; body.tool_choice = "auto"; }
     const headers = { "Content-Type": "application/json" };
     if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+    // Network errors and 429/5xx (including 503 while a server loads its model) are retried with
+    // backoff capped at 60 s for about 10 minutes, so a server restart does not fail attempts.
     let lastErr;
-    for (let attempt = 0; attempt < 5; attempt++) {
-        if (attempt) await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
+    for (let attempt = 0; attempt < 14; attempt++) {
+        if (attempt) await new Promise((r) => setTimeout(r, Math.min(60000, 2000 * 2 ** attempt)));
         const t0 = performance.now();
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), opts.requestTimeoutS * 1000);
