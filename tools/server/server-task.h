@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <memory>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -601,7 +602,8 @@ struct server_task_result_apply_lora : server_task_result {
 struct server_prompt {
     server_tokens tokens;
 
-    std::list<common_prompt_checkpoint> checkpoints;
+    // shared: copying a prompt into the cache copies pointers, the data is not changed after creation
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
     void clear() {
         tokens.clear();
@@ -620,9 +622,32 @@ struct server_prompt {
     }
 };
 
+// resize() leaves new elements uninitialized: state buffers are filled right after allocation
+template <typename T>
+struct server_default_init_allocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+        using other = server_default_init_allocator<U>;
+    };
+
+    using std::allocator<T>::allocator;
+
+    template <typename U>
+    void construct(U * p) {
+        ::new ((void *) p) U;
+    }
+
+    template <typename U, typename... Args>
+    void construct(U * p, Args &&... args) {
+        ::new ((void *) p) U(std::forward<Args>(args)...);
+    }
+};
+
+using server_state_buffer = std::vector<uint8_t, server_default_init_allocator<uint8_t>>;
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_state_buffer main;
+    server_state_buffer drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -633,11 +658,12 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // checkpoints shared with other entries or a slot are counted in full by each holder
     size_t size() const {
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
+            res += ckpt->size();
         }
 
         return res;
@@ -648,12 +674,12 @@ struct server_prompt_cache_state {
 // prompt, and eviction. Logged by the server so slow updates can be broken down.
 struct server_prompt_cache_timings {
     double t_size_ms    = 0.0; // llama_state_seq_get_size_ext for target and draft
-    double t_alloc_ms   = 0.0; // cache entry: host vectors, token and checkpoint copies, eviction to make room
+    double t_alloc_ms   = 0.0; // cache entry: host vectors, token copies, eviction to make room
     double t_get_tgt_ms = 0.0; // target state, device to host
     double t_get_dft_ms = 0.0; // draft state, device to host
     size_t n_get_tgt    = 0;
     size_t n_get_dft    = 0;
-    size_t n_ckpt       = 0;   // checkpoints copied into the cache entry
+    size_t n_ckpt       = 0;   // checkpoints shared with the cache entry
     size_t n_ckpt_bytes = 0;
 
     double t_scan_ms    = 0.0; // common prefix search over cached prompts
