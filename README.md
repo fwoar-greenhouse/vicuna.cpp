@@ -29,7 +29,8 @@ with the Vicuna model family.
     temporary in the memory pool
 - **Server:** saving and restoring a slot's state for the prompt cache uses a few large copies instead of thousands of
   small ones, and context checkpoints are shared with the cache instead of copied. With two slots and a unified KV
-  cache this cut prompt-cache updates from 1-3.5 s to 0.1-0.6 s. The log reports the time of each update and, with
+  cache this cut prompt-cache updates from 1-3.5 s to typically 0.1-0.6 s (worst seen about 1 s, before checkpoints
+were shared). The log reports the time of each update and, with
   `GGML_HIP_POOL_STATS`, the device memory held by each memory pool.
 - **Nix flake:** `nix build .#rocm` builds the ROCm package for gfx908 and reports the real git revision.
 
@@ -47,13 +48,21 @@ optimization). All runs use interleaved A/B measurements; see the parity doc for
 | Qwen3.8-27B, decode at 64k context (KV q8_0) | 18.0 t/s | 26.5 t/s (before the weight repack) |
 | Gemma 4 31B UD-Q5_K_XL, decode | 22.7 t/s | ~32 t/s |
 | Gemma 4 26B-A4B UD-Q5_K_XL (MoE), decode | 94.5 t/s | ~107 t/s |
-| Qwen3.8-27B, prefill at depth 0 (pp2048, KV q8_0/q4_0, `-ub 1024`) | 772 t/s | ~965 t/s |
-| Qwen3.8-27B, prefill at 48k context (pp2048, KV q8_0/q4_0, `-ub 1024`) | 491.6 t/s | 779.6 t/s |
+
+Long-context prefill, Qwen3.8-27B, pp2048 with KV q8_0/q4_0 and `-ub 1024 -b 2048`. "Before" is `16e14ce`
+(2026-10-05), which already had the decode work above, so these gains come from the prefill work alone (chunked
+DeltaNet, attention kernels):
+
+| depth | before | after |
+|---|---:|---:|
+| 0 | 775.8 t/s | ~965 t/s |
+| 16k | 649.8 t/s | 895 t/s |
+| 48k | 491.6 t/s | 779.6 t/s |
 
 In production (`llama-server`, two slots, MTP + ngram-mod speculative decoding, KV q8_0/q4_0, 262k context), serving
 OpenCode with Qwen3.8-27B:
 
-| | median |
+| | median (requests per row: 12-69) |
 |---|---:|
 | decode at 50-100k context | 74 t/s |
 | decode at 100-150k context | 62 t/s |
