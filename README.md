@@ -30,7 +30,8 @@ with the Vicuna model family.
 - **Server:** saving and restoring a slot's state for the prompt cache uses a few large copies instead of thousands of
   small ones, and context checkpoints are shared with the cache instead of copied. With two slots and a unified KV
   cache this cut prompt-cache updates from 1-3.5 s to typically 0.1-0.6 s (worst seen about 1 s, before checkpoints
-were shared). The log reports the time of each update and, with
+were shared). Context checkpoints hold only the state that can't be rolled back by truncation, so with an MTP
+draft they stay ~150-200 MiB instead of growing with the draft's KV cache (up to ~1 GiB each at 230k context). The log reports the time of each update and, with
   `GGML_HIP_POOL_STATS`, the device memory held by each memory pool.
 - **Nix flake:** `nix build .#rocm` builds the ROCm package for gfx908 and reports the real git revision.
 
