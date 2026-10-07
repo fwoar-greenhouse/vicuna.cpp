@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-cdna.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -293,6 +294,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_CDNA    = 500,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -433,6 +435,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
+    if (ggml_cuda_flash_attn_ext_cdna_supported(dst)) {
+        return BEST_FATTN_KERNEL_CDNA;
+    }
+
     // The MMA kernel converts quantized K/V while loading tiles, the tile kernel would need a converted copy of all of K/V:
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && Q->ne[0] % 64 == 0 && V->ne[0] % 64 == 0) {
         return BEST_FATTN_KERNEL_MMA_F16;
@@ -492,6 +498,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_CDNA:
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -515,6 +522,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_CDNA:
+            ggml_cuda_flash_attn_ext_cdna(ctx, dst);
             break;
     }
 }

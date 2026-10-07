@@ -12540,6 +12540,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512,  4, {8, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
         }
     }
+    // long prefill, Qwen3.8-27B shape (D=256, GQA 6), ubatch 512-2048
+    for (int kv : { 16384, 49152, 131072, }) {
+        for (int nb : { 512, 1024, 2048, }) {
+            for (auto [type_K, type_V] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+                    {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+            }
+        }
+    }
     // prompt processing with quantized and mixed K/V
     for (int kv : { 4096, 16384, }) {
         for (int nb : { 32, 64, 128, 256, 512, }) {
