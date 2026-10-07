@@ -15,9 +15,7 @@ typedef _Float16 fattn_cdna_h4 __attribute__((ext_vector_type(4)));
 typedef _Float16 fattn_cdna_h8 __attribute__((ext_vector_type(8)));
 typedef float    fattn_cdna_f4 __attribute__((ext_vector_type(4)));
 
-static constexpr int fattn_cdna_nwarps = 8;
 static constexpr int fattn_cdna_nbatch = 64; // KV rows per tile.
-static constexpr int fattn_cdna_ncols  = 64; // Q columns per CUDA block.
 
 typedef _Float16 fattn_cdna_h2 __attribute__((ext_vector_type(2)));
 
@@ -186,8 +184,8 @@ static __device__ __forceinline__ void fattn_cdna_sync() {
     asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 }
 
-template<int D, int ncols2, ggml_type type_K, ggml_type type_V>
-__launch_bounds__(fattn_cdna_nwarps*64, 1)
+template<int D, int ncols2, int nwarps, int np, ggml_type type_K, ggml_type type_V>
+__launch_bounds__(nwarps*64, 1)
 static __global__ void flash_attn_ext_cdna(
         const char * Q_ptr,
         const char * K_ptr,
@@ -214,11 +212,13 @@ static __global__ void flash_attn_ext_cdna(
     ggml_cuda_pdl_lc();
 #if defined(FLASH_ATTN_AVAILABLE) && defined(AMD_MFMA_AVAILABLE)
     static_assert(D == 256, "bad D");
-    constexpr int ncols   = fattn_cdna_ncols;
+    static_assert(np == 1 || np == 2, "bad np");
+    static_assert(nwarps == 4 || nwarps == 8, "bad nwarps");
+    constexpr int nrep    = 8/nwarps; // K blocks and V chunks per thread.
+    constexpr int ncols   = 16*nwarps/np;
     constexpr int ncols1  = ncols/ncols2;
     constexpr int nbatch  = fattn_cdna_nbatch;
-    constexpr int nblk    = D/32;  // 32 value blocks per K row.
-    constexpr int ngr_K   = D/8;   // 16 byte granules per K row.
+    constexpr int nh      = 2/np; // Halves of 32 KV rows of a tile per warp.
     constexpr float log2e = 1.4426950408889634f;
     // The max. in the log2 domain is shifted up by 3 (FATTN_KQ_MAX_OFFSET), it is only updated if it grows by more than max_slack.
     constexpr float max_offset = 3.0f;
@@ -236,12 +236,12 @@ static __global__ void flash_attn_ext_cdna(
     char * K_s = smem;
     char * V_s = smem + nbatch*D*2;
 
-    const int w  = __builtin_amdgcn_readfirstlane(threadIdx.y);
-    const int l  = threadIdx.x;
-    const int i  = l % 16;
-    const int g  = l / 16;
-    const int cg = w / 2; // Q column group.
-    const int kh = w % 2; // Half of the KV tile.
+    const int w   = __builtin_amdgcn_readfirstlane(threadIdx.y);
+    const int l   = threadIdx.x;
+    const int i   = l % 16;
+    const int g   = l / 16;
+    const int cg  = w / np;                  // Q column group.
+    const int kh0 = np == 2 ? w % 2 : 0;     // First half of the KV tile of this warp.
 
     const int gqa_ratio    = ne02 / ne12;
     const int ntiles_z_gqa = gqa_ratio / ncols2;
@@ -275,34 +275,45 @@ static __global__ void flash_attn_ext_cdna(
     K += nb13*sequence + nb12*z_KV;
     V += nb23*sequence + nb22*z_KV;
 
-    // K tile loads/stores: warp w has the rows 16*(w/2)..+15 and the blocks 4*(w%2)..+3.
+    // K tile loads/stores for the virtual warp vw = w + nwarps*r (8 in total): rows 16*(vw/2)..+15 and blocks 4*(vw%2)..+3.
     //     Within 8 consecutive lanes the rows are 0..3, 8..11 (+4) so that the 16 byte stores do not have bank conflicts.
-    const int row_K_ld = 16*(w/2) + (l % 4) + 8*((l/4) % 2) + 4*((l/8) % 2);
+    auto row_K_ld = [&](const int r) {
+        return 16*((w + nwarps*r)/2) + (l % 4) + 8*((l/4) % 2) + 4*((l/8) % 2);
+    };
     const int blk_K_ld = 4*(w % 2) + l/16;
     // V tile loads/stores: the thread has the KV rows 4*kg..4*kg+3 and the values dc*8..dc*8+7 (for q4_0 see fattn_cdna_V_index).
     const int kg_V = l % 16;
-    const int dc_V = 4*w + l/16;
+    auto dc_V = [&](const int r) {
+        return 4*(w + nwarps*r) + l/16;
+    };
 
     auto swz_K = [](const int row) {
         return (row & 3) | ((row >> 1) & 4);
     };
 
-    auto store_K = [&](const fattn_cdna_raw_K<type_K> & r) {
+    auto store_K = [&](const fattn_cdna_raw_K<type_K> * r) {
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const uint4 tmp = fattn_cdna_convert_K<type_K>(r, q);
-            *(uint4 *) (K_s + row_K_ld*(2*D) + 16*((4*blk_K_ld + q) ^ swz_K(row_K_ld))) = tmp;
+        for (int rr = 0; rr < nrep; ++rr) {
+            const int row = row_K_ld(rr);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint4 tmp = fattn_cdna_convert_K<type_K>(r[rr], q);
+                *(uint4 *) (K_s + row*(2*D) + 16*((4*blk_K_ld + q) ^ swz_K(row))) = tmp;
+            }
         }
     };
-    auto store_V = [&](const fattn_cdna_raw_V<type_V> & r) {
+    auto store_V = [&](const fattn_cdna_raw_V<type_V> * r) {
 #pragma unroll
-        for (int e = 0; e < 8; e += 2) {
-            uint32_t tmp[4];
-            fattn_cdna_convert_V<type_V>(r, e, tmp);
+        for (int rr = 0; rr < nrep; ++rr) {
 #pragma unroll
-            for (int k = 0; k < 2; ++k) {
-                const int d = fattn_cdna_V_index<type_V>(dc_V, e + k);
-                *(uint2 *) (V_s + d*(2*nbatch) + 16*((kg_V/2) ^ (d % 8)) + 8*(kg_V % 2)) = make_uint2(tmp[2*k + 0], tmp[2*k + 1]);
+            for (int e = 0; e < 8; e += 2) {
+                uint32_t tmp[4];
+                fattn_cdna_convert_V<type_V>(r[rr], e, tmp);
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    const int d = fattn_cdna_V_index<type_V>(dc_V(rr), e + k);
+                    *(uint2 *) (V_s + d*(2*nbatch) + 16*((kg_V/2) ^ (d % 8)) + 8*(kg_V % 2)) = make_uint2(tmp[2*k + 0], tmp[2*k + 1]);
+                }
             }
         }
     };
@@ -310,30 +321,46 @@ static __global__ void flash_attn_ext_cdna(
     const __amdgpu_buffer_rsrc_t rsrc_K = fattn_cdna_rsrc(K);
     const __amdgpu_buffer_rsrc_t rsrc_V = fattn_cdna_rsrc(V);
     const __amdgpu_buffer_rsrc_t rsrc_M = fattn_cdna_rsrc(mask + nb33*(sequence % ne33));
-    const int voff_K = row_K_ld*nb11 + blk_K_ld*(type_K == GGML_TYPE_F16 ? 64 : fattn_cdna_block_size<type_K>());
-    const int voff_V = 4*kg_V*nb21 + (type_V == GGML_TYPE_F16 ? 16*dc_V : (dc_V/4)*fattn_cdna_block_size<type_V>());
-    const int voff_M = (col_ok ? j_Q : int(ne01.z) - 1)*nb31 + 2*(32*kh + 8*g);
+    const int voff_K = row_K_ld(0)*nb11 + blk_K_ld*(type_K == GGML_TYPE_F16 ? 64 : fattn_cdna_block_size<type_K>());
+    const int voff_V = 4*kg_V*nb21 + (type_V == GGML_TYPE_F16 ? 16*dc_V(0) : (dc_V(0)/4)*fattn_cdna_block_size<type_V>());
+    const int voff_M = (col_ok ? j_Q : int(ne01.z) - 1)*nb31 + 2*(32*kh0 + 8*g);
 
-    auto load_K = [&](const int it, fattn_cdna_raw_K<type_K> & r) {
-        fattn_cdna_load_K<type_K>(rsrc_K, voff_K, it*nbatch*nb11, r);
+    // Virtual warp w + nwarps*r has the K rows 16*(nwarps/2)*r further down, the V values 32*nwarps*r further right.
+    auto load_K = [&](const int it, fattn_cdna_raw_K<type_K> * r) {
+#pragma unroll
+        for (int rr = 0; rr < nrep; ++rr) {
+            fattn_cdna_load_K<type_K>(rsrc_K, voff_K, (it*nbatch + 8*nwarps*rr)*nb11, r[rr]);
+        }
     };
-    auto load_V = [&](const int it, fattn_cdna_raw_V<type_V> & r) {
-        fattn_cdna_load_V<type_V>(rsrc_V, voff_V, dc_V % 4, it*nbatch*nb21, nb21, r);
+    auto load_V = [&](const int it, fattn_cdna_raw_V<type_V> * r) {
+#pragma unroll
+        for (int rr = 0; rr < nrep; ++rr) {
+            constexpr int dV = type_V == GGML_TYPE_F16 ? 2*32*nwarps : (nwarps)*fattn_cdna_block_size<type_V>();
+            fattn_cdna_load_V<type_V>(rsrc_V, voff_V + dV*rr, dc_V(0) % 4, it*nbatch*nb21, nb21, r[rr]);
+        }
     };
-    auto load_mask = [&](const int it, uint4 & r) {
-        fattn_cdna_load16((uint32_t *) &r, rsrc_M, voff_M, 2*it*nbatch);
+    auto load_mask = [&](const int it, uint4 * r) {
+#pragma unroll
+        for (int h = 0; h < nh; ++h) {
+            fattn_cdna_load16((uint32_t *) &r[h], rsrc_M, voff_M + 64*h, 2*it*nbatch);
+        }
     };
 
     // Shared memory addresses for the MFMA A matrices.
-    // K for KQ tile m (KV rows 32*kh + 8*g + 4*m + 0..3 in the C matrix): lane i reads row 32*kh + 8*(i/4) + 4*m + i%4, granule (4*p + g) ^ (i % 8).
+    // K for KQ tile m of half kh (KV rows 32*kh + 8*g + 4*m + 0..3 in the C matrix):
+    //     lane i reads row 32*kh + 8*(i/4) + 4*m + i%4, granule (4*p + g) ^ (i % 8).
     const int xs    = i % 8;
-    const int row_K = 32*kh + 8*(i/4) + (i % 4);
+    const int row_K = 32*kh0 + 8*(i/4) + (i % 4);
     const int gx    = (g ^ (xs & 3));
     const int xb    = xs >> 2;
     const char * K_A_even = K_s + row_K*(2*D) + 16*gx + 64*xb;
     const char * K_A_odd  = K_s + row_K*(2*D) + 16*gx - 64*xb;
     // V^T for VKQ tile t: lane i reads row 16*t + i, granule (4*kh + g) ^ (i % 8): the KV rows 32*kh + 8*g + 0..7.
-    const char * V_A = V_s + i*(2*nbatch) + 16*((4*kh + g) ^ xs);
+    const char * V_A[nh];
+#pragma unroll
+    for (int h = 0; h < nh; ++h) {
+        V_A[h] = V_s + i*(2*nbatch) + 16*((4*(kh0 + h) + g) ^ xs);
+    }
 
     fattn_cdna_f4 VKQ[D/16];
 #pragma unroll
@@ -350,9 +377,9 @@ static __global__ void flash_attn_ext_cdna(
     int it = blockIdx.y;
 
     if (it < ntiles) {
-        fattn_cdna_raw_K<type_K> rK;
-        fattn_cdna_raw_V<type_V> rV;
-        uint4 rM;
+        fattn_cdna_raw_K<type_K> rK[nrep];
+        fattn_cdna_raw_V<type_V> rV[nrep];
+        uint4 rM[nh];
         load_K(it, rK);
         load_V(it, rV);
         load_mask(it, rM);
@@ -364,32 +391,52 @@ static __global__ void flash_attn_ext_cdna(
             const int it_next = it + int(gridDim.y) < ntiles ? it + int(gridDim.y) : it;
             load_K(it_next, rK);
 
-            fattn_cdna_f4 KQ[2] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+            fattn_cdna_f4 KQ[nh][2];
 #pragma unroll
-            for (int p = 0; p < D/32; ++p) {
-                const char * base = p % 2 == 0 ? K_A_even : K_A_odd;
+            for (int h = 0; h < nh; ++h) {
+                KQ[h][0] = fattn_cdna_f4{0.0f, 0.0f, 0.0f, 0.0f};
+                KQ[h][1] = fattn_cdna_f4{0.0f, 0.0f, 0.0f, 0.0f};
+            }
+            {
+                // The K reads for p + 1 are issued before the MFMAs of p.
+                auto load_K_A = [&](const int p, fattn_cdna_h8 * K_A) {
+                    const char * base = p % 2 == 0 ? K_A_even : K_A_odd;
 #pragma unroll
-                for (int m = 0; m < 2; ++m) {
-                    const fattn_cdna_h8 K_A = *(const fattn_cdna_h8 *) (base + (4*m)*(2*D) + 64*p);
-                    KQ[m] = __builtin_amdgcn_mfma_f32_16x16x16f16(__builtin_shufflevector(K_A, K_A, 0, 1, 2, 3), Q_B[2*p + 0], KQ[m], 0, 0, 0);
-                    KQ[m] = __builtin_amdgcn_mfma_f32_16x16x16f16(__builtin_shufflevector(K_A, K_A, 4, 5, 6, 7), Q_B[2*p + 1], KQ[m], 0, 0, 0);
+                    for (int hm = 0; hm < 2*nh; ++hm) {
+                        K_A[hm] = *(const fattn_cdna_h8 *) (base + (32*(hm/2) + 4*(hm%2))*(2*D) + 64*p);
+                    }
+                };
+                fattn_cdna_h8 K_A[2][2*nh];
+                load_K_A(0, K_A[0]);
+#pragma unroll
+                for (int p = 0; p < D/32; ++p) {
+                    if (p + 1 < D/32) {
+                        load_K_A(p + 1, K_A[(p + 1) % 2]);
+                    }
+#pragma unroll
+                    for (int hm = 0; hm < 2*nh; ++hm) {
+                        const fattn_cdna_h8 a = K_A[p % 2][hm];
+                        KQ[hm/2][hm%2] = __builtin_amdgcn_mfma_f32_16x16x16f16(__builtin_shufflevector(a, a, 0, 1, 2, 3), Q_B[2*p + 0], KQ[hm/2][hm%2], 0, 0, 0);
+                        KQ[hm/2][hm%2] = __builtin_amdgcn_mfma_f32_16x16x16f16(__builtin_shufflevector(a, a, 4, 5, 6, 7), Q_B[2*p + 1], KQ[hm/2][hm%2], 0, 0, 0);
+                    }
                 }
             }
 
             store_V(rV);
 
-            // Softmax, KQ[m][r] is the value of column jc and KV row 32*kh + 8*g + 4*m + r:
-            float s[8];
-            {
-                const fattn_cdna_h8 mh = __builtin_bit_cast(fattn_cdna_h8, rM);
+            // Softmax, KQ[h][m][r] is the value of column jc and KV row 32*(kh0 + h) + 8*g + 4*m + r:
+            float s[8*nh];
+#pragma unroll
+            for (int h = 0; h < nh; ++h) {
+                const fattn_cdna_h8 mh = __builtin_bit_cast(fattn_cdna_h8, rM[h]);
 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
-                    s[k] = KQ[k/4][k%4] + log2e*(float) mh[k];
+                    s[8*h + k] = KQ[h][k/4][k%4] + log2e*(float) mh[k];
                 }
             }
             float KQ_max_new = s[0];
 #pragma unroll
-            for (int k = 1; k < 8; ++k) {
+            for (int k = 1; k < 8*nh; ++k) {
                 KQ_max_new = fmaxf(KQ_max_new, s[k]);
             }
             KQ_max_new = fmaxf(KQ_max_new, __shfl_xor(KQ_max_new, 16, 64));
@@ -405,12 +452,12 @@ static __global__ void flash_attn_ext_cdna(
                     VKQ[t] *= KQ_max_scale;
                 }
             }
-            fattn_cdna_h4 P_B[2];
+            fattn_cdna_h4 P_B[nh][2];
 #pragma unroll
-            for (int k = 0; k < 8; ++k) {
+            for (int k = 0; k < 8*nh; ++k) {
                 const float p = __builtin_amdgcn_exp2f(s[k] - KQ_max);
                 KQ_sum += p;
-                P_B[k/4][k%4] = (_Float16) p;
+                P_B[k/8][(k/4) % 2][k%4] = (_Float16) p;
             }
 
             fattn_cdna_sync();
@@ -418,11 +465,28 @@ static __global__ void flash_attn_ext_cdna(
             load_V(it_next, rV);
             load_mask(it_next, rM);
 
+            {
+                // The V reads for tile t + 1 are issued before the MFMAs of tile t.
+                fattn_cdna_h8 V_A8[2][nh];
 #pragma unroll
-            for (int t = 0; t < D/16; ++t) {
-                const fattn_cdna_h8 V_A8 = *(const fattn_cdna_h8 *) (V_A + t*16*(2*nbatch));
-                VKQ[t] = __builtin_amdgcn_mfma_f32_16x16x16f16(__builtin_shufflevector(V_A8, V_A8, 0, 1, 2, 3), P_B[0], VKQ[t], 0, 0, 0);
-                VKQ[t] = __builtin_amdgcn_mfma_f32_16x16x16f16(__builtin_shufflevector(V_A8, V_A8, 4, 5, 6, 7), P_B[1], VKQ[t], 0, 0, 0);
+                for (int h = 0; h < nh; ++h) {
+                    V_A8[0][h] = *(const fattn_cdna_h8 *) (V_A[h]);
+                }
+#pragma unroll
+                for (int t = 0; t < D/16; ++t) {
+                    if (t + 1 < D/16) {
+#pragma unroll
+                        for (int h = 0; h < nh; ++h) {
+                            V_A8[(t + 1) % 2][h] = *(const fattn_cdna_h8 *) (V_A[h] + (t + 1)*16*(2*nbatch));
+                        }
+                    }
+#pragma unroll
+                    for (int h = 0; h < nh; ++h) {
+                        const fattn_cdna_h8 a = V_A8[t % 2][h];
+                        VKQ[t] = __builtin_amdgcn_mfma_f32_16x16x16f16(__builtin_shufflevector(a, a, 0, 1, 2, 3), P_B[h][0], VKQ[t], 0, 0, 0);
+                        VKQ[t] = __builtin_amdgcn_mfma_f32_16x16x16f16(__builtin_shufflevector(a, a, 4, 5, 6, 7), P_B[h][1], VKQ[t], 0, 0, 0);
+                    }
+                }
             }
 
             store_K(rK);
@@ -439,54 +503,74 @@ static __global__ void flash_attn_ext_cdna(
     KQ_sum += __shfl_xor(KQ_sum, 16, 64);
     KQ_sum += __shfl_xor(KQ_sum, 32, 64);
 
-    // Combine the two warps of a column group: common max., then each warp sums up half of the VKQ tiles.
-    float2 * meta_s = (float2 *) smem; // [cg][kh][16]
-    if (g == 0) {
-        meta_s[(2*cg + kh)*16 + i] = make_float2(KQ_max, KQ_sum);
-    }
-    fattn_cdna_sync();
-    const float2 meta_other = meta_s[(2*cg + (kh ^ 1))*16 + i];
-    const float KQ_max_c    = fmaxf(KQ_max, meta_other.x);
-    const float KQ_scale    = __builtin_amdgcn_exp2f(KQ_max - KQ_max_c);
-    const float KQ_sum_c    = KQ_sum*KQ_scale + meta_other.y*__builtin_amdgcn_exp2f(meta_other.x - KQ_max_c);
-    fattn_cdna_sync();
+    const int head  = head0 + jc % ncols2;
+    const int j_dst = (sequence*int(ne01.z) + j_Q)*ne02 + head;
+    float * dst_j = dst + (int64_t(j_dst)*gridDim.y + blockIdx.y)*D;
 
-    constexpr int nt_half = D/32;
-    fattn_cdna_f4 * VKQ_s = (fattn_cdna_f4 *) smem; // [cg][kh][nt_half][64]
-    fattn_cdna_f4 * VKQ_s_own   = VKQ_s + (2*cg + kh)*nt_half*64 + l;
-    fattn_cdna_f4 * VKQ_s_other = VKQ_s + (2*cg + (kh ^ 1))*nt_half*64 + l;
-    // Warp kh writes the half of the VKQ tiles that the other warp finishes, kh is the same for the whole warp:
-    fattn_cdna_f4 VKQ_fin[nt_half];
-    if (kh == 0) {
+    if constexpr (np == 1) {
+        if (col_ok) {
+            const float KQ_sum_inv = 1.0f/KQ_sum;
 #pragma unroll
-        for (int t = 0; t < nt_half; ++t) {
-            VKQ_s_own[t*64] = VKQ[nt_half + t]*KQ_scale;
-            VKQ_fin[t] = VKQ[t]*KQ_scale;
+            for (int t = 0; t < D/16; ++t) {
+                fattn_cdna_f4 tmp = VKQ[t];
+                if (gridDim.y == 1) {
+                    tmp *= KQ_sum_inv;
+                }
+                *(float4 *) &dst_j[16*t + 4*g] = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
+            }
+            if (gridDim.y != 1 && g == 0) {
+                dst_meta[j_dst*gridDim.y + blockIdx.y] = make_float2(KQ_max/log2e, KQ_sum);
+            }
         }
     } else {
-#pragma unroll
-        for (int t = 0; t < nt_half; ++t) {
-            VKQ_s_own[t*64] = VKQ[t]*KQ_scale;
-            VKQ_fin[t] = VKQ[nt_half + t]*KQ_scale;
-        }
-    }
-    fattn_cdna_sync();
+        const int kh = kh0;
 
-    const int head = head0 + jc % ncols2;
-    if (col_ok) {
-        const int j_dst = (sequence*int(ne01.z) + j_Q)*ne02 + head;
-        const float KQ_sum_inv = 1.0f/KQ_sum_c;
-#pragma unroll
-        for (int t = 0; t < nt_half; ++t) {
-            fattn_cdna_f4 tmp = VKQ_fin[t] + VKQ_s_other[t*64];
-            if (gridDim.y == 1) {
-                tmp *= KQ_sum_inv;
-            }
-            const int d = 16*(kh*nt_half + t) + 4*g;
-            *(float4 *) &dst[(int64_t(j_dst)*gridDim.y + blockIdx.y)*D + d] = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
+        // Combine the two warps of a column group: common max., then each warp sums up half of the VKQ tiles.
+        float2 * meta_s = (float2 *) smem; // [cg][kh][16]
+        if (g == 0) {
+            meta_s[(2*cg + kh)*16 + i] = make_float2(KQ_max, KQ_sum);
         }
-        if (gridDim.y != 1 && kh == 0 && g == 0) {
-            dst_meta[j_dst*gridDim.y + blockIdx.y] = make_float2(KQ_max_c/log2e, KQ_sum_c);
+        fattn_cdna_sync();
+        const float2 meta_other = meta_s[(2*cg + (kh ^ 1))*16 + i];
+        const float KQ_max_c    = fmaxf(KQ_max, meta_other.x);
+        const float KQ_scale    = __builtin_amdgcn_exp2f(KQ_max - KQ_max_c);
+        const float KQ_sum_c    = KQ_sum*KQ_scale + meta_other.y*__builtin_amdgcn_exp2f(meta_other.x - KQ_max_c);
+        fattn_cdna_sync();
+
+        constexpr int nt_half = D/32;
+        fattn_cdna_f4 * VKQ_s = (fattn_cdna_f4 *) smem; // [cg][kh][nt_half][64]
+        fattn_cdna_f4 * VKQ_s_own   = VKQ_s + (2*cg + kh)*nt_half*64 + l;
+        fattn_cdna_f4 * VKQ_s_other = VKQ_s + (2*cg + (kh ^ 1))*nt_half*64 + l;
+        // Warp kh writes the half of the VKQ tiles that the other warp finishes, kh is the same for the whole warp:
+        fattn_cdna_f4 VKQ_fin[nt_half];
+        if (kh == 0) {
+#pragma unroll
+            for (int t = 0; t < nt_half; ++t) {
+                VKQ_s_own[t*64] = VKQ[nt_half + t]*KQ_scale;
+                VKQ_fin[t] = VKQ[t]*KQ_scale;
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < nt_half; ++t) {
+                VKQ_s_own[t*64] = VKQ[t]*KQ_scale;
+                VKQ_fin[t] = VKQ[nt_half + t]*KQ_scale;
+            }
+        }
+        fattn_cdna_sync();
+
+        if (col_ok) {
+            const float KQ_sum_inv = 1.0f/KQ_sum_c;
+#pragma unroll
+            for (int t = 0; t < nt_half; ++t) {
+                fattn_cdna_f4 tmp = VKQ_fin[t] + VKQ_s_other[t*64];
+                if (gridDim.y == 1) {
+                    tmp *= KQ_sum_inv;
+                }
+                *(float4 *) &dst_j[16*(kh*nt_half + t) + 4*g] = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
+            }
+            if (gridDim.y != 1 && kh == 0 && g == 0) {
+                dst_meta[j_dst*gridDim.y + blockIdx.y] = make_float2(KQ_max_c/log2e, KQ_sum_c);
+            }
         }
     }
 #else
@@ -503,11 +587,11 @@ static __global__ void flash_attn_ext_cdna(
 #endif // defined(FLASH_ATTN_AVAILABLE) && defined(AMD_MFMA_AVAILABLE)
 }
 
-template <int D, int ncols2, ggml_type type_K, ggml_type type_V>
+template <int D, int ncols2, int nwarps, int np, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_cdna_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    constexpr int ncols1 = fattn_cdna_ncols/ncols2;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_cdna<D, ncols2, type_K, type_V>;
-    launch_fattn<D, ncols1, ncols2>(ctx, dst, fattn_kernel, fattn_cdna_nwarps, 0, fattn_cdna_nbatch, false, false, false, 64);
+    constexpr int ncols1 = 16*nwarps/np/ncols2;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_cdna<D, ncols2, nwarps, np, type_K, type_V>;
+    launch_fattn<D, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, 0, fattn_cdna_nbatch, false, false, false, 64);
 }
 
 // Whether ggml_cuda_flash_attn_ext_cdna can be used for this FLASH_ATTN_EXT.
