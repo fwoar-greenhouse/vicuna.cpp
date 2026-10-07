@@ -4,8 +4,8 @@
 #include "fattn-common.cuh"
 
 // FlashAttention for large batches on CDNA (MFMA, wave64), head size 256, K/V as f16, q8_0 or q4_0.
-// A CUDA block of 8 warps works on 64 Q columns (64/ncols2 Q rows x ncols2 Q heads that use the same K/V head) and steps over K/V in tiles of 64 rows.
-// Warp w works on the Q columns 16*(w/2)..+15 and on the KV rows 32*(w%2)..+31 of each tile. The two warps of a column group are combined at the end.
+// A CUDA block of 8 warps works on 128 Q columns (128/ncols2 Q rows x ncols2 Q heads that use the same K/V head) and steps over K/V in tiles of 64 rows.
+// Warp w works on the Q columns 16*w..+15 and on all KV rows of a tile, as two halves of 32 rows.
 // Shared memory holds one K tile (row-major) and one V tile (transposed, KV rows contiguous) as f16, with an XOR swizzle of the 16 byte granules.
 // Each tile has two phases that end with a barrier: KQ reads the K tile while the V tile is written,
 //     VKQ reads the V tile while the next K tile is written. The global loads for a tile are issued one phase before the data is used.
@@ -184,7 +184,7 @@ static __device__ __forceinline__ void fattn_cdna_sync() {
     asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 }
 
-template<int D, int ncols2, int nwarps, int np, ggml_type type_K, ggml_type type_V>
+template<int D, int ncols2, int nwarps, ggml_type type_K, ggml_type type_V>
 __launch_bounds__(nwarps*64, 1)
 static __global__ void flash_attn_ext_cdna(
         const char * Q_ptr,
@@ -212,13 +212,12 @@ static __global__ void flash_attn_ext_cdna(
     ggml_cuda_pdl_lc();
 #if defined(FLASH_ATTN_AVAILABLE) && defined(AMD_MFMA_AVAILABLE)
     static_assert(D == 256, "bad D");
-    static_assert(np == 1 || np == 2, "bad np");
     static_assert(nwarps == 4 || nwarps == 8, "bad nwarps");
     constexpr int nrep    = 8/nwarps; // K blocks and V chunks per thread.
-    constexpr int ncols   = 16*nwarps/np;
+    constexpr int ncols   = 16*nwarps;
     constexpr int ncols1  = ncols/ncols2;
     constexpr int nbatch  = fattn_cdna_nbatch;
-    constexpr int nh      = 2/np; // Halves of 32 KV rows of a tile per warp.
+    constexpr int nh      = 2;    // Halves of 32 KV rows of a tile.
     constexpr float log2e = 1.4426950408889634f;
     // The max. in the log2 domain is shifted up by 3 (FATTN_KQ_MAX_OFFSET), it is only updated if it grows by more than max_slack.
     constexpr float max_offset = 3.0f;
@@ -240,8 +239,6 @@ static __global__ void flash_attn_ext_cdna(
     const int l   = threadIdx.x;
     const int i   = l % 16;
     const int g   = l / 16;
-    const int cg  = w / np;                  // Q column group.
-    const int kh0 = np == 2 ? w % 2 : 0;     // First half of the KV tile of this warp.
 
     const int gqa_ratio    = ne02 / ne12;
     const int ntiles_z_gqa = gqa_ratio / ncols2;
@@ -252,7 +249,7 @@ static __global__ void flash_attn_ext_cdna(
     const int ic0          = blockIdx.x*ncols1;
 
     // Q column of this thread in the MFMA layouts:
-    const int  jc     = 16*cg + i;
+    const int  jc     = 16*w + i;
     const int  j_Q    = ic0 + jc/ncols2;
     const bool col_ok = j_Q < int(ne01.z);
 
@@ -323,7 +320,7 @@ static __global__ void flash_attn_ext_cdna(
     const __amdgpu_buffer_rsrc_t rsrc_M = fattn_cdna_rsrc(mask + nb33*(sequence % ne33));
     const int voff_K = row_K_ld(0)*nb11 + blk_K_ld*(type_K == GGML_TYPE_F16 ? 64 : fattn_cdna_block_size<type_K>());
     const int voff_V = 4*kg_V*nb21 + (type_V == GGML_TYPE_F16 ? 16*dc_V(0) : (dc_V(0)/4)*fattn_cdna_block_size<type_V>());
-    const int voff_M = (col_ok ? j_Q : int(ne01.z) - 1)*nb31 + 2*(32*kh0 + 8*g);
+    const int voff_M = (col_ok ? j_Q : int(ne01.z) - 1)*nb31 + 2*8*g;
 
     // Virtual warp w + nwarps*r has the K rows 16*(nwarps/2)*r further down, the V values 32*nwarps*r further right.
     auto load_K = [&](const int it, fattn_cdna_raw_K<type_K> * r) {
@@ -347,19 +344,19 @@ static __global__ void flash_attn_ext_cdna(
     };
 
     // Shared memory addresses for the MFMA A matrices.
-    // K for KQ tile m of half kh (KV rows 32*kh + 8*g + 4*m + 0..3 in the C matrix):
-    //     lane i reads row 32*kh + 8*(i/4) + 4*m + i%4, granule (4*p + g) ^ (i % 8).
+    // K for KQ tile m of half h (KV rows 32*h + 8*g + 4*m + 0..3 in the C matrix):
+    //     lane i reads row 32*h + 8*(i/4) + 4*m + i%4, granule (4*p + g) ^ (i % 8).
     const int xs    = i % 8;
-    const int row_K = 32*kh0 + 8*(i/4) + (i % 4);
+    const int row_K = 8*(i/4) + (i % 4);
     const int gx    = (g ^ (xs & 3));
     const int xb    = xs >> 2;
     const char * K_A_even = K_s + row_K*(2*D) + 16*gx + 64*xb;
     const char * K_A_odd  = K_s + row_K*(2*D) + 16*gx - 64*xb;
-    // V^T for VKQ tile t: lane i reads row 16*t + i, granule (4*kh + g) ^ (i % 8): the KV rows 32*kh + 8*g + 0..7.
+    // V^T for VKQ tile t: lane i reads row 16*t + i, granule (4*h + g) ^ (i % 8): the KV rows 32*h + 8*g + 0..7.
     const char * V_A[nh];
 #pragma unroll
     for (int h = 0; h < nh; ++h) {
-        V_A[h] = V_s + i*(2*nbatch) + 16*((4*(kh0 + h) + g) ^ xs);
+        V_A[h] = V_s + i*(2*nbatch) + 16*((4*h + g) ^ xs);
     }
 
     fattn_cdna_f4 VKQ[D/16];
@@ -424,7 +421,7 @@ static __global__ void flash_attn_ext_cdna(
 
             store_V(rV);
 
-            // Softmax, KQ[h][m][r] is the value of column jc and KV row 32*(kh0 + h) + 8*g + 4*m + r:
+            // Softmax, KQ[h][m][r] is the value of column jc and KV row 32*h + 8*g + 4*m + r:
             float s[8*nh];
 #pragma unroll
             for (int h = 0; h < nh; ++h) {
@@ -507,70 +504,18 @@ static __global__ void flash_attn_ext_cdna(
     const int j_dst = (sequence*int(ne01.z) + j_Q)*ne02 + head;
     float * dst_j = dst + (int64_t(j_dst)*gridDim.y + blockIdx.y)*D;
 
-    if constexpr (np == 1) {
-        if (col_ok) {
-            const float KQ_sum_inv = 1.0f/KQ_sum;
+    if (col_ok) {
+        const float KQ_sum_inv = 1.0f/KQ_sum;
 #pragma unroll
-            for (int t = 0; t < D/16; ++t) {
-                fattn_cdna_f4 tmp = VKQ[t];
-                if (gridDim.y == 1) {
-                    tmp *= KQ_sum_inv;
-                }
-                *(float4 *) &dst_j[16*t + 4*g] = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
+        for (int t = 0; t < D/16; ++t) {
+            fattn_cdna_f4 tmp = VKQ[t];
+            if (gridDim.y == 1) {
+                tmp *= KQ_sum_inv;
             }
-            if (gridDim.y != 1 && g == 0) {
-                dst_meta[j_dst*gridDim.y + blockIdx.y] = make_float2(KQ_max/log2e, KQ_sum);
-            }
+            *(float4 *) &dst_j[16*t + 4*g] = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
         }
-    } else {
-        const int kh = kh0;
-
-        // Combine the two warps of a column group: common max., then each warp sums up half of the VKQ tiles.
-        float2 * meta_s = (float2 *) smem; // [cg][kh][16]
-        if (g == 0) {
-            meta_s[(2*cg + kh)*16 + i] = make_float2(KQ_max, KQ_sum);
-        }
-        fattn_cdna_sync();
-        const float2 meta_other = meta_s[(2*cg + (kh ^ 1))*16 + i];
-        const float KQ_max_c    = fmaxf(KQ_max, meta_other.x);
-        const float KQ_scale    = __builtin_amdgcn_exp2f(KQ_max - KQ_max_c);
-        const float KQ_sum_c    = KQ_sum*KQ_scale + meta_other.y*__builtin_amdgcn_exp2f(meta_other.x - KQ_max_c);
-        fattn_cdna_sync();
-
-        constexpr int nt_half = D/32;
-        fattn_cdna_f4 * VKQ_s = (fattn_cdna_f4 *) smem; // [cg][kh][nt_half][64]
-        fattn_cdna_f4 * VKQ_s_own   = VKQ_s + (2*cg + kh)*nt_half*64 + l;
-        fattn_cdna_f4 * VKQ_s_other = VKQ_s + (2*cg + (kh ^ 1))*nt_half*64 + l;
-        // Warp kh writes the half of the VKQ tiles that the other warp finishes, kh is the same for the whole warp:
-        fattn_cdna_f4 VKQ_fin[nt_half];
-        if (kh == 0) {
-#pragma unroll
-            for (int t = 0; t < nt_half; ++t) {
-                VKQ_s_own[t*64] = VKQ[nt_half + t]*KQ_scale;
-                VKQ_fin[t] = VKQ[t]*KQ_scale;
-            }
-        } else {
-#pragma unroll
-            for (int t = 0; t < nt_half; ++t) {
-                VKQ_s_own[t*64] = VKQ[t]*KQ_scale;
-                VKQ_fin[t] = VKQ[nt_half + t]*KQ_scale;
-            }
-        }
-        fattn_cdna_sync();
-
-        if (col_ok) {
-            const float KQ_sum_inv = 1.0f/KQ_sum_c;
-#pragma unroll
-            for (int t = 0; t < nt_half; ++t) {
-                fattn_cdna_f4 tmp = VKQ_fin[t] + VKQ_s_other[t*64];
-                if (gridDim.y == 1) {
-                    tmp *= KQ_sum_inv;
-                }
-                *(float4 *) &dst_j[16*(kh*nt_half + t) + 4*g] = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
-            }
-            if (gridDim.y != 1 && kh == 0 && g == 0) {
-                dst_meta[j_dst*gridDim.y + blockIdx.y] = make_float2(KQ_max_c/log2e, KQ_sum_c);
-            }
+        if (gridDim.y != 1 && g == 0) {
+            dst_meta[j_dst*gridDim.y + blockIdx.y] = make_float2(KQ_max/log2e, KQ_sum);
         }
     }
 #else
@@ -587,10 +532,11 @@ static __global__ void flash_attn_ext_cdna(
 #endif // defined(FLASH_ATTN_AVAILABLE) && defined(AMD_MFMA_AVAILABLE)
 }
 
-template <int D, int ncols2, int nwarps, int np, ggml_type type_K, ggml_type type_V>
+template <int D, int ncols2, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_cdna_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    constexpr int ncols1 = 16*nwarps/np/ncols2;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_cdna<D, ncols2, nwarps, np, type_K, type_V>;
+    constexpr int nwarps = 8;
+    constexpr int ncols1 = 16*nwarps/ncols2;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_cdna<D, ncols2, nwarps, type_K, type_V>;
     launch_fattn<D, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, 0, fattn_cdna_nbatch, false, false, false, 64);
 }
 

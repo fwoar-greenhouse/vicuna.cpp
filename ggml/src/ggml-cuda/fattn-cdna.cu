@@ -1,11 +1,5 @@
 #include "fattn-cdna.cuh"
 
-#ifndef FATTN_CDNA_NP
-#define FATTN_CDNA_NP 1
-#endif
-#ifndef FATTN_CDNA_NWARPS
-#define FATTN_CDNA_NWARPS 8
-#endif
 
 static bool ggml_cuda_fattn_cdna_type_ok(const ggml_type type_K, const ggml_type type_V) {
     return (type_K == GGML_TYPE_F16  && type_V == GGML_TYPE_F16)  ||
@@ -64,7 +58,13 @@ bool ggml_cuda_flash_attn_ext_cdna_supported(const ggml_tensor * dst) {
     if (gqa_ratio % 2 != 0) {
         return false;
     }
-    return Q->ne[1] >= 256;
+    // With a power of 2 GQA ratio the MMA kernel puts more Q heads into a block, it is faster for short K/V
+    //     and for GQA 8 with few Q rows.
+    if ((gqa_ratio & (gqa_ratio - 1)) == 0 && (K->ne[1] < 2048 || (gqa_ratio >= 8 && Q->ne[1] < 32))) {
+        return false;
+    }
+    // Up to 16 Q rows the vector kernel is used.
+    return Q->ne[1] > 16;
 }
 
 template <int ncols2>
@@ -72,13 +72,13 @@ static void ggml_cuda_flash_attn_ext_cdna_switch_type(ggml_backend_cuda_context 
     const ggml_type type_K = dst->src[1]->type;
     const ggml_type type_V = dst->src[2]->type;
     if (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
-        ggml_cuda_flash_attn_ext_cdna_case<256, ncols2, FATTN_CDNA_NWARPS, FATTN_CDNA_NP, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+        ggml_cuda_flash_attn_ext_cdna_case<256, ncols2, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
     } else if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
-        ggml_cuda_flash_attn_ext_cdna_case<256, ncols2, FATTN_CDNA_NWARPS, FATTN_CDNA_NP, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        ggml_cuda_flash_attn_ext_cdna_case<256, ncols2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
     } else if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q4_0) {
-        ggml_cuda_flash_attn_ext_cdna_case<256, ncols2, FATTN_CDNA_NWARPS, FATTN_CDNA_NP, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
+        ggml_cuda_flash_attn_ext_cdna_case<256, ncols2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
     } else if (type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0) {
-        ggml_cuda_flash_attn_ext_cdna_case<256, ncols2, FATTN_CDNA_NWARPS, FATTN_CDNA_NP, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+        ggml_cuda_flash_attn_ext_cdna_case<256, ncols2, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
     } else {
         GGML_ABORT("fatal error");
     }

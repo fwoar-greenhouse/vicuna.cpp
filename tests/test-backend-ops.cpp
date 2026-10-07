@@ -11857,6 +11857,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // large batches with quantized or mixed K/V (on ROCm converted to f16 per call)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1536, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    // verify-sized batches (17-65 rows) and large logits with the CDNA kernel (D=256, even GQA ratio)
+    for (int nb : { 17, 40, 65, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1536, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 2048, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 2, {6, 1}, 2048, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1536, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 260, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 1024, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
@@ -12546,6 +12552,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (auto [type_K, type_V] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
                     {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+            }
+        }
+    }
+    // D=256, GQA 2-8: short K/V (first ubatches, sliding window) and verify-sized batches
+    for (int kv : { 1024, 2048, 16384, }) {
+        for (int nb : { 17, 64, 256, 1024, }) {
+            for (int nr2 : { 2, 4, 6, 8, }) {
+                for (auto [type_K, type_V] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+                        {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                }
             }
         }
     }
