@@ -20,9 +20,17 @@ with the Vicuna model family.
 - **MI100 kernels**, among others:
   - weight repack at load time into a layout that the GEMV can stream at close to full bandwidth (on by default)
   - MFMA flash attention for decode and speculative-verify batches, reading quantized K/V directly
+  - a flash-attention kernel for prefill and large verify batches at head size 256, built for CDNA1: it reads
+    q8_0/q4_0 K/V directly and runs about 2x faster than converting the cache to f16 first
   - tuned MMVQ/MMQ crossovers and MMQ configurations for 1-32 columns
   - chunked gated delta rule on MFMA for prefill of hybrid models (Qwen3.5/3.8 family)
   - many small-kernel fusions and wave64-aware reductions
+  - hipBLAS fallbacks dequantize large weights in chunks of rows, so a big output layer never needs a multi-GiB
+    temporary in the memory pool
+- **Server:** saving and restoring a slot's state for the prompt cache uses a few large copies instead of thousands of
+  small ones, and context checkpoints are shared with the cache instead of copied. With two slots and a unified KV
+  cache this cut prompt-cache updates from 1-3.5 s to 0.1-0.6 s. The log reports the time of each update and, with
+  `GGML_HIP_POOL_STATS`, the device memory held by each memory pool.
 - **Nix flake:** `nix build .#rocm` builds the ROCm package for gfx908 and reports the real git revision.
 
 The full list, with measurements, profiles, prior art and the remaining backlog, is in
@@ -39,10 +47,22 @@ optimization). All runs use interleaved A/B measurements; see the parity doc for
 | Qwen3.8-27B, decode at 64k context (KV q8_0) | 18.0 t/s | 26.5 t/s (before the weight repack) |
 | Gemma 4 31B UD-Q5_K_XL, decode | 22.7 t/s | ~32 t/s |
 | Gemma 4 26B-A4B UD-Q5_K_XL (MoE), decode | 94.5 t/s | ~107 t/s |
-| Qwen3.8-27B, prefill at 48k context (pp2048, KV q8_0/q4_0, `-ub 1024`) | 491.6 t/s | 646.9 t/s (since `16e14ce`) |
+| Qwen3.8-27B, prefill at depth 0 (pp2048, KV q8_0/q4_0, `-ub 1024`) | 772 t/s | ~965 t/s |
+| Qwen3.8-27B, prefill at 48k context (pp2048, KV q8_0/q4_0, `-ub 1024`) | 491.6 t/s | 779.6 t/s |
 
-With `llama-server`, MTP speculative decoding and KV q8_0/q4_0, Qwen3.8-27B generates about **53 t/s at 115k context**
-and about **80 t/s on short-context code generation** (depending on draft acceptance).
+In production (`llama-server`, two slots, MTP + ngram-mod speculative decoding, KV q8_0/q4_0, 262k context), serving
+OpenCode with Qwen3.8-27B:
+
+| | median |
+|---|---:|
+| decode at 50-100k context | 74 t/s |
+| decode at 100-150k context | 62 t/s |
+| decode at 150-230k context | 50 t/s |
+| cold 67k-token prompt | 860 t/s |
+| prefill at 128-192k depth | ~550 t/s |
+
+On the coding eval in `scripts/coding-eval`, the same model on this server passes 34/36 agentic attempts, the same
+score as the hosted model on OpenRouter.
 
 ## Quick start
 
@@ -78,7 +98,9 @@ Runtime switches specific to this fork:
 | variable | default | effect |
 |---|---|---|
 | `GGML_HIP_REPACK` | on | `0` keeps weights in the GGUF layout instead of the repacked MI100 layout |
-| `GGML_HIP_FA_KV_F16` | on | `0` disables the f16 copy of quantized K/V for large prefill batches (saves ~940 MiB at 262k context, slightly slower prefill) |
+| `GGML_HIP_FA_CDNA` | on | `0` disables the CDNA flash-attention kernel for prefill and large verify batches |
+| `GGML_HIP_FA_KV_F16` | on | `0` disables the f16 copy of quantized K/V that large prefill batches still use where the CDNA kernel does not apply (head size 256 with an odd GQA ratio or other K/V type pairs) |
+| `GGML_HIP_POOL_STATS` | off | `<seconds>`: log the device memory used and each memory pool's size at most this often |
 
 All FlashAttention K/V type pairs are compiled by default (`GGML_CUDA_FA_QUANTS=all`), so mixed caches such as
 K q8_0 / V q4_0 run at full speed.
@@ -91,8 +113,9 @@ Changes are checked on the MI100 with:
 - `llama-perplexity --kl-divergence` against the previous build for every change to numerics
 - interleaved `llama-bench` runs on a four-model suite (Qwen3.8-27B, Gemma 4 31B, Gemma 4 26B-A4B and its QAT variant)
 - the production `llama-server` command for end-to-end prefill and speculative-decoding numbers
-- [scripts/coding-eval](scripts/coding-eval) (work in progress): a coding benchmark run against any OpenAI-compatible
-  endpoint, with model-written JavaScript checked and run in a capability-restricted sandbox
+- [scripts/coding-eval](scripts/coding-eval): a coding benchmark run against any OpenAI-compatible endpoint. Twelve
+  JavaScript problems in a plain mode and an agentic red/green/refactor mode, graded by hidden tests; the model's
+  code is checked statically and run in a capability-restricted sandbox (Deno with no permissions, under bubblewrap)
 
 ## Supported backends
 
