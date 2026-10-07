@@ -28,11 +28,13 @@ BWRAP="$(readlink -f "$(command -v bwrap)")"
 
 endpoint=""
 out="results"
+regrade=""
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
     case "${args[$i]}" in
         --endpoint) endpoint="${args[$((i + 1))]:-}" ;;
         --out) out="${args[$((i + 1))]:-}" ;;
+        --regrade) regrade=1 ;;
     esac
 done
 
@@ -46,9 +48,12 @@ perms=(--allow-read="$HERE" --allow-env=CODING_EVAL_TOKEN)
 run_perm="$DENO"
 [ "$BWRAP" != none ] && run_perm="$run_perm,$BWRAP"
 perms+=(--allow-run="$run_perm")
-if [ -n "$endpoint" ]; then
+# --regrade only reads and rewrites the results: no network access
+if [ -n "$endpoint" ] && [ -z "$regrade" ]; then
     hostport="$(printf '%s' "$endpoint" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#/.*$##; s#^[^@]*@##')"
     perms+=(--allow-net="$hostport")
+fi
+if [ -n "$endpoint" ] || [ -n "$regrade" ]; then
     mkdir -p "$out"
     out_abs="$(cd "$out" && pwd)"
     perms+=(--allow-read="$HERE,$out_abs" --allow-write="$out_abs")

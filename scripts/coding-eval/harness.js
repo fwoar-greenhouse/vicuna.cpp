@@ -22,7 +22,7 @@ function parseArgs(argv) {
         runs: 3, mode: "both", out: "results", maxTokens: 65536, maxSteps: 12, sandboxTimeoutMs: 20000,
         requestTimeoutS: 1800, parallel: 1, temperature: undefined, topP: undefined,
     };
-    const flags = new Set(["self-check", "help", "resume"]);
+    const flags = new Set(["self-check", "help", "resume", "regrade"]);
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (!a.startsWith("--")) throw new Error(`unexpected argument ${a}`);
@@ -70,6 +70,7 @@ const USAGE = `usage: run.sh --endpoint URL --model ID [options]
   --top-k N             top-k (default: server default)
   --reasoning-effort E  low, medium or high (default: server default)
   --resume              keep finished attempts in the label directory and run only the missing ones
+  --regrade             re-extract and re-grade the saved plain-mode replies of --label (no requests)
   --max-tokens N        max tokens per reply (default: 65536)
   --max-steps N         max model calls per agentic phase (default: 12)
   --parallel N          attempts in flight at once (default: 1)
@@ -362,9 +363,22 @@ async function runTool(opts, state, phase, name, rawArgs) {
 // ---------------------------------------------------------------------------------------------
 // attempts
 
+// Fenced code blocks, from fence lines. Fences are paired from the start and, if that leaves one unpaired, also from
+// the end: a reply can begin inside a block (a provider split reasoning and content in the middle of one), and pairing
+// only from the start would then take the prose between blocks for code. Sorted by where the block ends.
+function codeBlocks(text) {
+    const lines = text.split("\n");
+    const fences = [];
+    lines.forEach((l, i) => { const m = /^\s*```([A-Za-z0-9_+-]*)/.exec(l); if (m) fences.push({ i, lang: m[1].toLowerCase() }); });
+    const pairs = new Map();
+    const add = (o, c) => pairs.set(`${o.i}:${c.i}`, { lang: o.lang, end: c.i, code: lines.slice(o.i + 1, c.i).join("\n") + "\n" });
+    for (let k = 0; k + 1 < fences.length; k += 2) add(fences[k], fences[k + 1]);
+    if (fences.length % 2) for (let k = fences.length - 1; k >= 1; k -= 2) add(fences[k - 1], fences[k]);
+    return [...pairs.values()].sort((a, b) => a.end - b.end);
+}
+
 function extractModule(text) {
-    const blocks = [...text.matchAll(/```([A-Za-z0-9_+-]*)[^\n]*\n([\s\S]*?)```/g)].map((m) => ({ lang: m[1].toLowerCase(), code: m[2] }));
-    const js = blocks.filter((b) => ["", "js", "javascript", "mjs"].includes(b.lang));
+    const js = codeBlocks(text).filter((b) => ["", "js", "javascript", "mjs"].includes(b.lang));
     for (const b of [...js].reverse()) if (checkSource(b.code, "module").ok) return { source: b.code, how: "last valid js block" };
     if (js.length) return { source: js[js.length - 1].code, how: "last js block (does not pass the checker)" };
     return { source: text, how: "whole reply (no code block)" };
@@ -559,6 +573,45 @@ async function selfCheck(opts, problems) {
     return bad;
 }
 
+// Re-run extraction and grading on the saved replies of plain attempts, e.g. after a fix to either. Stats and the
+// transcript stay as they were; module.js and result.json are rewritten, and the summary rebuilt.
+async function regrade(opts, problems) {
+    if (!opts.label) throw new Error("--regrade needs --label");
+    const root = `${opts.out}/${opts.label}`;
+    const meta = JSON.parse(await Deno.readTextFile(`${root}/meta.json`));
+    const rows = [];
+    let changed = 0;
+    for (const p of problems) {
+        for (const mode of ["plain", "agentic"]) {
+            for (let run = 1; run <= (meta.runs ?? 3); run++) {
+                const dir = `${root}/${p.id}/${mode}/run-${run}`;
+                const prev = await readResult(dir);
+                if (!prev) continue;
+                if (mode === "agentic") { rows.push(rowFromResult(p.id, mode, run, prev)); continue; }
+                const t = JSON.parse(await Deno.readTextFile(`${dir}/transcript.json`));
+                const reply = t.messages.filter((m) => m.role === "assistant").at(-1)?.content ?? "";
+                const ex = extractModule(reply);
+                const check = checkSource(ex.source, "module");
+                const src = check.ok ? check.source : ex.source;
+                const hidden = summarizeRun(await sandboxRun(opts, src, [p.hidden]));
+                const result = { ...prev, extraction: ex.how, checker: check.errors, hidden: { ok: hidden.ok, passed: hidden.passed, total: hidden.total, report: hidden.text } };
+                if (prev.hidden.passed !== hidden.passed || prev.hidden.total !== hidden.total) {
+                    changed++;
+                    console.log(`${p.id} plain run ${run}: ${prev.hidden.passed}/${prev.hidden.total} -> ${hidden.passed}/${hidden.total}`);
+                }
+                await Deno.writeTextFile(`${dir}/module.js`, src);
+                await Deno.writeTextFile(`${dir}/result.json`, JSON.stringify(result, null, 2));
+                rows.push(rowFromResult(p.id, mode, run, result));
+            }
+        }
+    }
+    rows.sort((a, b) => a.problem.localeCompare(b.problem) || a.mode.localeCompare(b.mode) || a.run - b.run);
+    await Deno.writeTextFile(`${root}/summary.json`, JSON.stringify({ meta, rows }, null, 2));
+    await Deno.writeTextFile(`${root}/summary.md`, summaryMarkdown(meta, rows));
+    console.log(`regraded ${root}: ${changed} plain attempts changed`);
+    return 0;
+}
+
 function rowFromResult(problem, mode, run, r) {
     const st = r.stats ?? {};
     return {
@@ -583,6 +636,7 @@ async function main() {
     const problems = await loadProblems(opts.problems);
     if (opts["self-check"]) return (await selfCheck(opts, problems)) ? 1 : 0;
 
+    if (opts.regrade) return await regrade(opts, problems);
     if (!opts.endpoint || !opts.model) { console.error(USAGE); return 2; }
     opts.token ??= Deno.env.get("CODING_EVAL_TOKEN") || undefined;
     const started = new Date().toISOString();
