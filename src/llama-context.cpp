@@ -2781,9 +2781,63 @@ public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_read_host() {
-        // flush the reads
+        // Same problem as llama_io_write_host, host-to-device: restored cells land in free cells between other
+        // sequences' cells, so there are many short ranges. Ranges of the same tensor that are close together are
+        // written as one span. The bytes between the ranges belong to other sequences, so the span is first read back
+        // from the device and the ranges are patched in. Copies are synchronous and in order, so this is safe.
+        constexpr size_t max_gap = 128*1024;
+
+        std::vector<const read_info *> order;
+        order.reserve(rinfos.size());
         for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            order.push_back(&rinfo);
+        }
+        std::sort(order.begin(), order.end(), [](const read_info * a, const read_info * b) {
+            return a->tensor != b->tensor ? a->tensor < b->tensor : a->offset < b->offset;
+        });
+
+        std::vector<uint8_t> staging;
+        for (size_t i = 0; i < order.size(); ) {
+            ggml_tensor * tensor = order[i]->tensor;
+            const size_t  begin  = order[i]->offset;
+            size_t        end    = begin + order[i]->size;
+            size_t        j      = i + 1;
+            while (j < order.size() && order[j]->tensor == tensor && order[j]->offset <= end + max_gap) {
+                end = std::max(end, order[j]->offset + order[j]->size);
+                j++;
+            }
+
+            // no gaps and no overlaps: the ranges tile [begin, end)
+            bool   tiled       = true;
+            bool   host_contig = true;
+            size_t pos         = begin;
+            for (size_t k = i; k < j; ++k) {
+                tiled       = tiled       && order[k]->offset == pos;
+                host_contig = host_contig && order[k]->ptr == order[i]->ptr + (order[k]->offset - begin);
+                pos = order[k]->offset + order[k]->size;
+            }
+            host_contig = host_contig && tiled;
+
+            if (host_contig) {
+                ggml_backend_tensor_set(tensor, order[i]->ptr, begin, end - begin);
+            } else if (!tiled && j - i < 3) {
+                // a read-back plus a write is no fewer copies than two writes
+                for (size_t k = i; k < j; ++k) {
+                    ggml_backend_tensor_set(tensor, order[k]->ptr, order[k]->offset, order[k]->size);
+                }
+            } else {
+                staging.resize(end - begin);
+                if (!tiled) {
+                    ggml_backend_tensor_get(tensor, staging.data(), begin, end - begin);
+                }
+                // patch in the original order, in case ranges overlap
+                std::sort(order.begin() + i, order.begin() + j);
+                for (size_t k = i; k < j; ++k) {
+                    memcpy(staging.data() + (order[k]->offset - begin), order[k]->ptr, order[k]->size);
+                }
+                ggml_backend_tensor_set(tensor, staging.data(), begin, end - begin);
+            }
+            i = j;
         }
     }
 
